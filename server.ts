@@ -12,9 +12,10 @@ import cookieParser from 'cookie-parser';
 import path from 'path';
 import fs from 'fs';
 import { fileURLToPath } from 'url';
-import { createServer as createViteServer } from 'vite';
+
 import { Pool, QueryResult } from 'pg';
 import bcrypt from 'bcryptjs';
+import crypto from 'node:crypto';
 
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
@@ -146,7 +147,7 @@ const sensitiveKeys = new Map([
   ['contact', 10],
   ['newsletter', 10],
 ]);
-function applyRateLimit(req: Request, res: Response, next: NextFunction): void {
+function applyRateLimit(req: Request, res: Response, next: NextFunction): Response | void {
   const path = req.path.toLowerCase();
   for (const [key, max] of sensitiveKeys) {
     if (path.includes(key)) {
@@ -178,7 +179,7 @@ const authenticateToken = (req: Request, res: Response, next: NextFunction) => {
   }
 };
 
-function requireAdmin(req: Request, res: Response, next: NextFunction): void {
+function requireAdmin(req: Request, res: Response, next: NextFunction): Response | void {
   const user = (req as any).user;
   if (!user || user.role !== 'admin') {
     return res.status(403).json({ error: { code: 'FORBIDDEN', message: 'Admin access required' } });
