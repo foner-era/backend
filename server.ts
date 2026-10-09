@@ -516,13 +516,11 @@ app.get('/api/bootstrap', async (_req: Request, res: Response) => {
   try {
     const client = await pool.connect();
     try {
-      const [categoriesResult, productsResult, bannersResult, settingsResult, reviewsResult] = await Promise.all([
-        client.query('SELECT * FROM categories ORDER BY sort_order ASC'),
-        client.query('SELECT * FROM products WHERE stock > 0 ORDER BY is_featured DESC, is_new_arrival DESC, created_at DESC LIMIT 50'),
-        client.query('SELECT * FROM banners WHERE is_active = true ORDER BY sort_order ASC'),
-        client.query('SELECT setting_key, setting_value FROM store_settings'),
-        client.query('SELECT * FROM reviews ORDER BY created_at DESC LIMIT 20'),
-      ]);
+      const categoriesResult = await client.query('SELECT * FROM categories ORDER BY sort_order ASC');
+      const productsResult = await client.query('SELECT * FROM products WHERE stock > 0 ORDER BY is_featured DESC, is_new_arrival DESC, created_at DESC LIMIT 50');
+      const bannersResult = await client.query('SELECT * FROM banners WHERE is_active = true ORDER BY sort_order ASC');
+      const settingsResult = await client.query('SELECT setting_key, setting_value FROM store_settings');
+      const reviewsResult = await client.query('SELECT * FROM reviews ORDER BY created_at DESC LIMIT 20');
 
       // Transform store settings
       const settings: Record<string, any> = {};
@@ -946,7 +944,7 @@ app.post('/api/orders', authenticateToken, async (req: Request, res: Response) =
       const validItems = [];
       
       for (const item of items) {
-        const productResult = await client.query('SELECT * FROM products WHERE id = $1 AND stock >= $2', [item.product_id, item.quantity || 1]);
+        const productResult = await client.query('SELECT * FROM products WHERE id = $1 AND stock >= $2 FOR UPDATE', [item.product_id, item.quantity || 1]);
         if (productResult.rows.length === 0) {
           await client.query('ROLLBACK');
           return res.status(400).json({ error: { code: 'STOCK_INSUFFICIENT', message: `Product ${item.product_id} is unavailable or insufficient stock` } });
@@ -1267,6 +1265,11 @@ app.post(['/api/admin/upload', '/api/upload'], authenticateToken, requireAdmin, 
       return res.status(400).json({ error: { code: 'INVALID_IMAGE', message: 'Invalid image data format' } });
     }
     
+    // Size limit: 5MB max
+    const maxSize = 5 * 1024 * 1024;
+    if (matches[2].length * 0.75 > maxSize) {
+      return res.status(400).json({ error: { code: 'FILE_TOO_LARGE', message: 'Image exceeds 5MB limit' } });
+    }
     const ext = filename.split('.').pop() || 'png';
     const safeName = `upload_${Date.now()}_${Math.random().toString(36).substring(2, 8)}.${ext}`;
     
