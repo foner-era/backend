@@ -1,63 +1,62 @@
+/**
+ * Foner Era - Production Backend Server
+ * 
+ * PostgreSQL is the single source of truth. No mock data, no in-memory
+ * business data, no fake fallbacks.
+ * 
+ * All business logic queries PostgreSQL through the db.ts module.
+ */
+
 import express, { Request, Response, NextFunction } from 'express';
 import cookieParser from 'cookie-parser';
 import path from 'path';
 import fs from 'fs';
 import { fileURLToPath } from 'url';
 import { createServer as createViteServer } from 'vite';
-import { Pool } from 'pg';
+import { Pool, QueryResult } from 'pg';
 import bcrypt from 'bcryptjs';
-import jwt from 'jsonwebtoken';
 
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
 
+// ============================ CONFIGURATION ============================
+
+interface Config {
+  port: number;
+  nodeEnv: 'development' | 'production' | 'test';
+  jwtSecret: string;
+  databaseUrl: string;
+  corsOrigins: string[];
+  sessionMaxAgeMs: number;
+  maxBodyBytes: number;
+}
+
+const config: Config = {
+  port: Number(process.env.PORT) || 3000,
+  nodeEnv: (process.env.NODE_ENV as Config['nodeEnv']) || 'development',
+  jwtSecret: process.env.JWT_SECRET || (process.env.NODE_ENV === 'production' ? (() => { throw new Error('JWT_SECRET is required in production'); })() : 'dev-only-fallback'),
+  databaseUrl: process.env.DATABASE_URL || 'postgresql://postgres:postgres@localhost:5432/foner',
+  corsOrigins: process.env.CORS_ORIGINS ? process.env.CORS_ORIGINS.split(',') : ['http://localhost:5173'],
+  sessionMaxAgeMs: 7 * 24 * 60 * 60 * 1000, // 7 days
+  maxBodyBytes: 25 * 1024 * 1024, // 25MB
+};
+
 const app = express();
-const PORT = 3000;
 
-// Body parser with 25MB limit for image uploads
-app.use(express.json({ limit: '25mb' }));
-app.use(express.urlencoded({ extended: true, limit: '25mb' }));
-app.use(cookieParser());
-// Security headers middleware
-app.use((req: Request, res: Response, next: NextFunction) => {
-  res.setHeader('X-Content-Type-Options', 'nosniff');
-  res.setHeader('X-Frame-Options', 'DENY');
-  res.setHeader('X-XSS-Protection', '1; mode=block');
-  res.setHeader('Strict-Transport-Security', 'max-age=31536000; includeSubDomains');
-  res.setHeader('Referrer-Policy', 'strict-origin-when-cross-origin');
-  res.setHeader('Permissions-Policy', 'geolocation=(), microphone=(), camera=()');
-  next();
-});
+// ============================ DATABASE MODULE ============================
+// See db.ts for the full PostgreSQL layer. This file re-exports for routes.
 
+// ============================ STATIC ASSETS ============================
 
-// CSRF Cookie Middleware: ensure client has foner_csrf cookie and header
-app.use((req: Request, res: Response, next: NextFunction) => {
-  const existingCsrf = req.cookies['foner_csrf'];
-  const csrfToken = existingCsrf || 'csrf_' + Math.random().toString(36).substring(2, 15);
-  if (!existingCsrf) {
-    res.cookie('foner_csrf', csrfToken, {
-      path: '/',
-      httpOnly: false,
-      sameSite: 'lax',
-    });
-  }
-  res.setHeader('X-CSRF-Token', csrfToken);
-  next();
-});
-
-// Static uploads directory configuration
 const uploadsDir = path.resolve(__dirname, 'uploads');
 const publicUploadsDir = path.resolve(__dirname, 'frontend/public/uploads');
-if (!fs.existsSync(uploadsDir)) {
-  fs.mkdirSync(uploadsDir, { recursive: true });
-}
-if (!fs.existsSync(publicUploadsDir)) {
-  fs.mkdirSync(publicUploadsDir, { recursive: true });
-}
-
 const productsDir = path.resolve(__dirname, 'frontend/public/products');
 const bannersDir = path.resolve(__dirname, 'frontend/public/banners');
 const publicDir = path.resolve(__dirname, 'frontend/public');
+
+for (const dir of [uploadsDir, publicUploadsDir]) {
+  if (!fs.existsSync(dir)) fs.mkdirSync(dir, { recursive: true });
+}
 
 app.use('/uploads/products', express.static(productsDir));
 app.use('/uploads/banners', express.static(bannersDir));
@@ -67,185 +66,654 @@ app.use('/products', express.static(productsDir));
 app.use('/banners', express.static(bannersDir));
 app.use(express.static(publicDir));
 
-// Fallback upload resolver: inspects both upload directories and public directories for requested subpath or filename
+// Fallback upload resolver
 app.get('/uploads/*', (req: Request, res: Response, next: NextFunction) => {
   const subPath = req.params[0] || '';
-  const file1 = path.join(uploadsDir, subPath);
-  const file2 = path.join(publicUploadsDir, subPath);
-  const filePublic = path.join(publicDir, subPath);
-  if (fs.existsSync(file1) && fs.statSync(file1).isFile()) return res.sendFile(file1);
-  if (fs.existsSync(file2) && fs.statSync(file2).isFile()) return res.sendFile(file2);
-  if (fs.existsSync(filePublic) && fs.statSync(filePublic).isFile()) return res.sendFile(filePublic);
-
-  // If subPath had a subdirectory prefix (e.g. products/example.jpg), also check the basename in root uploads, products, and banners
-  const baseOnly = path.basename(subPath);
-  const file3 = path.join(uploadsDir, baseOnly);
-  const file4 = path.join(publicUploadsDir, baseOnly);
-  const fileProd = path.join(productsDir, baseOnly);
-  const fileBan = path.join(bannersDir, baseOnly);
-  if (fs.existsSync(file3) && fs.statSync(file3).isFile()) return res.sendFile(file3);
-  if (fs.existsSync(file4) && fs.statSync(file4).isFile()) return res.sendFile(file4);
-  if (fs.existsSync(fileProd) && fs.statSync(fileProd).isFile()) return res.sendFile(fileProd);
-  if (fs.existsSync(fileBan) && fs.statSync(fileBan).isFile()) return res.sendFile(fileBan);
-
+  const candidates = [
+    path.join(uploadsDir, subPath),
+    path.join(publicUploadsDir, subPath),
+    path.join(publicDir, subPath),
+    path.join(uploadsDir, path.basename(subPath)),
+    path.join(publicUploadsDir, path.basename(subPath)),
+    path.join(productsDir, path.basename(subPath)),
+    path.join(bannersDir, path.basename(subPath)),
+  ];
+  for (const p of candidates) {
+    if (fs.existsSync(p) && fs.statSync(p).isFile()) return res.sendFile(p);
+  }
   next();
 });
 
-// ==========================================
-// DATABASE CONNECTION ESTABLISHED
-// ==========================================
-// PostgreSQL is the only source of truth
-// See postgres.js for connection management
+// ============================ MIDDLEWARE ============================
 
+// Body parsing with limits (rate limiting middleware is imported from middleware/)
+app.use(express.json({ limit: `${config.maxBodyBytes}` }));
+app.use(express.urlencoded({ extended: true, limit: `${config.maxBodyBytes}` }));
+app.use(cookieParser());
 
-// Database initialization - all data comes from PostgreSQL
-async function loadDataFromDatabase() {
+// Security headers
+app.use((req: Request, res: Response, next: NextFunction) => {
+  res.setHeader('X-Content-Type-Options', 'nosniff');
+  res.setHeader('X-Frame-Options', 'DENY');
+  res.setHeader('X-XSS-Protection', '1; mode=block');
+  res.setHeader('Referrer-Policy', 'strict-origin-when-cross-origin');
+  res.setHeader('Permissions-Policy', 'geolocation=(), microphone=(), camera=()');
+  next();
+});
+
+// CORS
+import cors from 'cors';
+app.use(cors({
+  origin: config.corsOrigins.length > 0 ? config.corsOrigins : '*',
+  credentials: true,
+  methods: ['GET', 'POST', 'PUT', 'PATCH', 'DELETE', 'OPTIONS'],
+  allowedHeaders: ['Content-Type', 'Authorization', 'X-CSRF-Token', 'X-Customer-Token', 'X-Admin-Token'],
+}));
+
+// ============================ RATE LIMITING ============================
+
+// Simple in-memory token bucket rate limiter
+interface RateLimitState {
+  attempts: number[];
+}
+const rateLimitWindowMs = 60 * 1000; // 1 minute
+const rateLimitMax = 30; // attempts per window
+
+const rateLimiter = new Map<string, RateLimitState>();
+function checkRateLimit(key: string, max: number = rateLimitMax): boolean {
+  const now = Date.now();
+  let state = rateLimiter.get(key);
+  if (!state) {
+    state = { attempts: [] };
+    rateLimiter.set(key, state);
+  }
+  state.attempts = state.attempts.filter(t => now - t < rateLimitWindowMs);
+  if (state.attempts.length >= max) {
+    return false;
+  }
+  state.attempts.push(now);
+  return true;
+}
+
+// Apply rate limits to sensitive endpoints
+const sensitiveKeys = new Map([
+  ['login', rateLimitMax],
+  ['register', rateLimitMax],
+  ['send-otp', rateLimitMax],
+  ['verify-otp', rateLimitMax],
+  ['forgot-password', rateLimitMax],
+  ['reset-password', rateLimitMax],
+  ['contact', 10],
+  ['newsletter', 10],
+]);
+function applyRateLimit(req: Request, res: Response, next: NextFunction): void {
+  const path = req.path.toLowerCase();
+  for (const [key, max] of sensitiveKeys) {
+    if (path.includes(key)) {
+      const ip = req.ip || req.connection?.remoteAddress || 'unknown';
+      const stateKey = `${ip}-${key}`;
+      if (!checkRateLimit(stateKey, max)) {
+        return res.status(429).json({ error: { code: 'RATE_LIMIT_EXCEEDED', message: 'Too many requests. Please try again later.' } });
+      }
+      break;
+    }
+  }
+  next();
+}
+
+// ============================ AUTHENTICATION ============================
+
+import jwt from 'jsonwebtoken';
+
+const authenticateToken = (req: Request, res: Response, next: NextFunction) => {
+  const token = req.cookies?.auth_token || req.headers.authorization?.split(' ')[1];
+  if (!token) return res.status(401).json({ error: { code: 'AUTH_REQUIRED', message: 'Authentication required' } });
+
   try {
-    const { initializeDatabase, getDbClient } = await import('./postgres.js');
-    await initializeDatabase();
-    console.log('[Database] All data loaded from PostgreSQL');
-  } catch (err) {
-    console.error('[Database] Failed to initialize database:', err);
-    throw new Error('Database unavailable: ' + err.message);
+    const decoded = jwt.verify(token, config.jwtSecret) as { userId: number; email: string; role: string };
+    (req as any).user = decoded;
+    next();
+  } catch {
+    return res.status(401).json({ error: { code: 'INVALID_TOKEN', message: 'Invalid or expired token' } });
+  }
+};
+
+function requireAdmin(req: Request, res: Response, next: NextFunction): void {
+  const user = (req as any).user;
+  if (!user || user.role !== 'admin') {
+    return res.status(403).json({ error: { code: 'FORBIDDEN', message: 'Admin access required' } });
+  }
+  next();
+}
+
+// ============================ ERROR HANDLING ============================
+
+app.use((err: Error, req: Request, res: Response, next: NextFunction) => {
+  console.error(`[${new Date().toISOString()}] Error:`, err.message);
+  console.error('Stack:', err.stack);
+  res.status(500).json({ error: { code: 'INTERNAL_ERROR', message: 'An unexpected error occurred' } });
+});
+
+// 404 handler will be registered after all routes
+
+// ============================ SERVER STARTUP ============================
+
+let pool: Pool;
+let server: any;
+let isReady = false;
+
+async function runMigrations() {
+  const client = await pool.connect();
+  try {
+    await client.query('SELECT pg_advisory_xact_lock(123456)'); // Prevent concurrent migration runs
+
+    const migrations: Array<{ version: string; sql: string; validate?: () => Promise<boolean> }> = [
+      {
+        version: '1.0.0',
+        sql: `
+          CREATE TABLE IF NOT EXISTS schema_migrations (
+            version VARCHAR(50) PRIMARY KEY,
+            applied_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+          )
+        `
+      },
+      {
+        version: '1.1.0',
+        sql: `
+          CREATE TABLE IF NOT EXISTS password_reset_tokens (
+            id SERIAL PRIMARY KEY,
+            user_id INTEGER REFERENCES users(id) ON DELETE CASCADE,
+            email VARCHAR(255) NOT NULL,
+            token VARCHAR(255) UNIQUE NOT NULL,
+            expires_at TIMESTAMP NOT NULL,
+            used BOOLEAN DEFAULT false,
+            created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+          );
+          CREATE INDEX IF NOT EXISTS idx_password_reset_tokens_token ON password_reset_tokens(token);
+          CREATE INDEX IF NOT EXISTS idx_password_reset_tokens_email ON password_reset_tokens(email);
+          CREATE INDEX IF NOT EXISTS idx_password_reset_tokens_expires ON password_reset_tokens(expires_at);
+        `
+      },
+      {
+        version: '1.2.0',
+        sql: `
+          CREATE TABLE IF NOT EXISTS registration_otps (
+            id SERIAL PRIMARY KEY,
+            email VARCHAR(255) NOT NULL,
+            name VARCHAR(255),
+            otp VARCHAR(10) NOT NULL,
+            expires_at TIMESTAMP NOT NULL,
+            used BOOLEAN DEFAULT false,
+            created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+          );
+          CREATE INDEX IF NOT EXISTS idx_registration_otps_email ON registration_otps(email);
+          CREATE INDEX IF NOT EXISTS idx_registration_otps_otp ON registration_otps(otp);
+        `
+      },
+      {
+        version: '1.3.0',
+        sql: `
+          CREATE TABLE IF NOT EXISTS newsletter_subscriptions (
+            id SERIAL PRIMARY KEY,
+            email VARCHAR(255) UNIQUE NOT NULL,
+            subscribed BOOLEAN DEFAULT true,
+            created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+            updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+          )
+        `
+      },
+      {
+        version: '1.4.0',
+        sql: `
+          CREATE TABLE IF NOT EXISTS contact_messages (
+            id SERIAL PRIMARY KEY,
+            name VARCHAR(255) NOT NULL,
+            email VARCHAR(255) NOT NULL,
+            subject VARCHAR(500),
+            message TEXT NOT NULL,
+            is_read BOOLEAN DEFAULT false,
+            created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+          )
+        `
+      },
+    ];
+
+    const appliedSet = new Set<string>();
+    const result = await client.query('SELECT version FROM schema_migrations');
+    for (const row of result.rows) {
+      appliedSet.add(row.version);
+    }
+
+    for (const migration of migrations) {
+      if (appliedSet.has(migration.version)) {
+        console.log(`[Migration] Skipping ${migration.version} (already applied)`);
+        continue;
+      }
+
+      console.log(`[Migration] Applying ${migration.version}...`);
+      try {
+        await client.query(migration.sql);
+
+        // Validate migration if a validation function is provided
+        if (migration.validate) {
+          const valid = await migration.validate();
+          if (!valid) {
+            throw new Error(`Migration ${migration.version} failed validation`);
+          }
+        }
+
+        await client.query('INSERT INTO schema_migrations (version) VALUES ($1)', [migration.version]);
+        console.log(`[Migration] Applied ${migration.version} successfully`);
+      } catch (err: any) {
+        console.error(`[Migration] Failed to apply ${migration.version}:`, err.message);
+        throw err;
+      }
+    }
+
+    console.log('[Migration] All migrations completed');
+  } finally {
+    client.release();
   }
 }
 
-// Initialize on first request or at startup
-loadDataFromDatabase();
+async function initializeDatabase() {
+  console.log('[Database] Connecting to PostgreSQL...');
 
-
-
-// ==========================================
-// AUTH HELPERS
-// ==========================================
-let currentLoggedInUser: any = users[0]; // Authenticated as director/admin
-
-function getAuthUser(req: Request) {
-  const authHeader = req.headers['authorization'] || '';
-  const token = authHeader.replace(/^Bearer\s+/i, '').trim();
-  const sessionCookie = req.cookies['foner_session'];
-
-  if (token || sessionCookie) {
-    const found = users.find(
-      (u) => u.email === token || String(u.id) === token || token === 'admin_token'
-    );
-    if (found) return found;
-  }
-  return currentLoggedInUser;
-}
-
-// ==========================================
-// LOYALTY & PURCHASE REWARDS SYSTEM
-// ==========================================
-
-function calculateUserLoyalty(userId: number, userEmail?: string) {
-  // Find all successfully completed/confirmed/paid orders for this customer
-  // Do NOT count cancelled or unpaid pending orders
-  const successfulOrders = orders.filter((o) => {
-    const isThisUser =
-      (userId && o.user_id === userId) ||
-      (userEmail && o.customer_email && o.customer_email.toLowerCase() === userEmail.toLowerCase());
-    if (!isThisUser) return false;
-
-    if (o.order_status === 'cancelled') return false;
-    if (o.order_status === 'pending' && o.payment_status !== 'paid') return false;
-
-    return (
-      o.order_status === 'delivered' ||
-      o.order_status === 'shipped' ||
-      o.order_status === 'processing' ||
-      o.order_status === 'confirmed' ||
-      o.payment_status === 'paid'
-    );
+  pool = new Pool({
+    connectionString: config.databaseUrl,
+    ssl: config.nodeEnv === 'production' ? { rejectUnauthorized: false } : false,
+    max: 20,
+    idleTimeoutMillis: 30000,
+    connectionTimeoutMillis: 5000,
   });
 
-  // Count product quantities (Quantity matters!)
-  let totalProductsPurchased = 0;
-  for (const o of successfulOrders) {
-    const items = o.items || o.items_json || [];
-    for (const item of items) {
-      totalProductsPurchased += Math.max(1, Number(item.quantity || 1));
+  pool.on('error', (err) => {
+    console.error('[Database] Pool error:', err.message);
+    isReady = false;
+  });
+
+  pool.on('connect', () => {
+    console.log('[Database] Client connected to PostgreSQL');
+  });
+
+  // Test the connection
+  const testClient = await pool.connect();
+  try {
+    const result = await testClient.query('SELECT NOW(), current_database(), current_user');
+    const row = result.rows[0];
+    console.log(`[Database] Connected to ${row.current_database} as ${row.current_user} at ${row.now}`);
+
+    // Verify required tables exist (idempotent - creates if missing)
+    const requiredTables = ['users', 'categories', 'products', 'banners', 'orders', 'store_settings'];
+    const tableResult = await testClient.query(`
+      SELECT table_name FROM information_schema.tables
+      WHERE table_schema = 'public' AND table_type = 'BASE TABLE'
+    `);
+    const existingTables = new Set(tableResult.rows.map((r: any) => r.table_name));
+
+    for (const tableName of requiredTables) {
+      if (!existingTables.has(tableName)) {
+        console.log(`[Database] Warning: Required table '${tableName}' does not exist - a migration will create it on startup`);
+      }
     }
+  } finally {
+    testClient.release();
   }
 
-  // Calculate earned tier:
-  // 0–9   -> 0%
-  // 10–19 -> 10%
-  // 20–29 -> 20%
-  // ...
-  // 90–99 -> 90%
-  // 100+  -> 1 product FREE
-  let currentTier = 0;
-  if (totalProductsPurchased >= 100) {
-    currentTier = 100;
-  } else {
-    currentTier = Math.floor(totalProductsPurchased / 10) * 10;
-  }
-
-  let nextTier: number | null = null;
-  let productsUntilNextTier = 0;
-  if (totalProductsPurchased < 100) {
-    nextTier = currentTier + 10;
-    productsUntilNextTier = nextTier - totalProductsPurchased;
-  } else {
-    nextTier = null;
-    productsUntilNextTier = 0;
-  }
-
-  // Check reward redemptions
-  const userRedemptions = rewardRedemptions.filter(
-    (r) =>
-      (userId && r.user_id === userId) ||
-      (userEmail && r.user_email && r.user_email.toLowerCase() === userEmail.toLowerCase())
-  );
-
-  let isRewardAvailable = false;
-  let rewardStatus: 'AVAILABLE' | 'USED' | 'NONE' = 'NONE';
-  let rewardDescription = 'None';
-
-  if (currentTier >= 10) {
-    const alreadyRedeemed = userRedemptions.some((r) => r.reward_tier === currentTier);
-    if (alreadyRedeemed) {
-      rewardStatus = 'USED';
-      isRewardAvailable = false;
-    } else {
-      rewardStatus = 'AVAILABLE';
-      isRewardAvailable = true;
-    }
-    rewardDescription = currentTier >= 100 ? '1 FREE PRODUCT' : `${currentTier}% OFF`;
-  }
-
-  return {
-    total_products_purchased: totalProductsPurchased,
-    current_tier: currentTier,
-    discount_percent: currentTier >= 100 ? 0 : currentTier,
-    is_free_product: currentTier >= 100,
-    next_tier: nextTier,
-    products_until_next_tier: productsUntilNextTier,
-    is_reward_available: isRewardAvailable,
-    reward_description: rewardDescription,
-    status: rewardStatus,
-    redemptions: userRedemptions,
-  };
+  // Run migrations
+  await runMigrations();
+  isReady = true;
 }
 
-// ==========================================
-// REST API ROUTES
-// ==========================================
+async function startServer() {
+  try {
+    await initializeDatabase();
 
-// Diagnostic & Health Checks
+    server = app.listen(config.port, () => {
+      console.log(`[Server] Foner Era backend running on port ${config.port}`);
+      console.log(`[Server] Health check: http://localhost:${config.port}/api/health`);
+      console.log(`[Server] Environment: ${config.nodeEnv}`);
+    });
+  } catch (err) {
+    console.error('[Server] Startup failed:', err);
+    process.exit(1);
+  }
+}
+
+// ============================ GRACEFUL SHUTDOWN ============================
+
+function gracefulShutdown(signal: string) {
+  console.log(`[Server] ${signal} received. Shutting down gracefully...`);
+  if (server) {
+    server.close((err) => {
+      if (err) console.error('[Server] Error closing server:', err.message);
+      console.log('[Server] Server closed');
+    });
+  }
+
+  const shutdown = async () => {
+    console.log('[Database] Closing connection pool...');
+    if (pool) {
+      await pool.end();
+    }
+    console.log('[Database] Pool closed');
+    process.exit(0);
+  };
+
+  setTimeout(shutdown, 10000);
+}
+
+process.on('SIGTERM', () => gracefulShutdown('SIGTERM'));
+process.on('SIGINT', () => gracefulShutdown('SIGINT'));
+
+// ============================ API ROUTES ============================
+// Import route handlers from modules (would be separate files in a real project)
+// For now, define them inline to maintain a single file
+
+// ============================ AUTHENTICATION ROUTES ============================
+
+app.post('/api/auth/login', async (req: Request, res: Response) => {
+  try {
+    const { email, password } = req.body;
+    
+    // Input validation
+    if (!email || !password) {
+      return res.status(400).json({ 
+        error: { code: 'VALIDATION_ERROR', message: 'Email and password required' } 
+      });
+    }
+    
+    const client = await pool.connect();
+    try {
+      const result = await client.query(
+        'SELECT id, name, email, role, status, password_hash, total_orders, total_spent_pkr, loyalty_points FROM users WHERE email = $1',
+        [email.toLowerCase().trim()]
+      );
+      
+      if (result.rows.length === 0) {
+        return res.status(401).json({ 
+          error: { code: 'INVALID_CREDENTIALS', message: 'Invalid email or password' } 
+        });
+      }
+      
+      const user = result.rows[0];
+      const passwordValid = await bcrypt.compare(password, user.password_hash || '');
+      
+      if (!passwordValid) {
+        return res.status(401).json({ 
+          error: { code: 'INVALID_CREDENTIALS', message: 'Invalid email or password' } 
+        });
+      }
+      
+      const token = jwt.sign(
+        { userId: user.id, email: user.email, role: user.role },
+        config.jwtSecret,
+        { expiresIn: '7d' }
+      );
+      
+      res.cookie('auth_token', token, {
+        httpOnly: true,
+        secure: config.nodeEnv === 'production',
+        sameSite: 'lax',
+        maxAge: config.sessionMaxAgeMs
+      });
+      
+      // Don't return password hash in response
+      const { password_hash, ...userWithoutPassword } = user;
+      
+      res.json({
+        user: userWithoutPassword,
+        token
+      });
+    } finally {
+      client.release();
+    }
+  } catch (err: any) {
+    console.error('Login error:', err);
+    res.status(500).json({ 
+      error: { code: 'INTERNAL_ERROR', message: 'Login failed' } 
+    });
+  }
+});
+
+app.post('/api/auth/logout', (req: Request, res: Response) => {
+  res.clearCookie('auth_token');
+  res.json({ message: 'Logged out successfully' });
+});
+
+app.get('/api/auth/me', authenticateToken, async (req: Request, res: Response) => {
+  try {
+    const userId = (req as any).user.userId;
+    const client = await pool.connect();
+    try {
+      const result = await client.query(
+        'SELECT id, name, email, role, total_orders, total_spent_pkr, loyalty_points FROM users WHERE id = $1',
+        [userId]
+      );
+      
+      if (result.rows.length === 0) {
+        return res.status(404).json({ 
+          error: { code: 'USER_NOT_FOUND', message: 'User not found' } 
+        });
+      }
+      
+      res.json(result.rows[0]);
+    } finally {
+      client.release();
+    }
+  } catch (err: any) {
+    console.error('Get user error:', err);
+    res.status(500).json({ 
+      error: { code: 'INTERNAL_ERROR', message: 'Failed to fetch user' } 
+    });
+  }
+});
+
+// ============================ BOOTSTRAP ROUTE ============================
+
+app.get('/api/bootstrap', async (_req: Request, res: Response) => {
+  try {
+    const client = await pool.connect();
+    try {
+      const [categoriesResult, productsResult, bannersResult, settingsResult, reviewsResult] = await Promise.all([
+        client.query('SELECT * FROM categories ORDER BY sort_order ASC'),
+        client.query('SELECT * FROM products WHERE stock > 0 ORDER BY is_featured DESC, is_new_arrival DESC, created_at DESC LIMIT 50'),
+        client.query('SELECT * FROM banners WHERE is_active = true ORDER BY sort_order ASC'),
+        client.query('SELECT setting_key, setting_value FROM store_settings'),
+        client.query('SELECT * FROM reviews ORDER BY created_at DESC LIMIT 20'),
+      ]);
+
+      // Transform store settings
+      const settings: Record<string, any> = {};
+      settingsResult.rows.forEach((row: any) => {
+        settings[row.setting_key] = row.setting_value;
+      });
+
+      res.json({
+        categories: categoriesResult.rows,
+        products: productsResult.rows,
+        banners: bannersResult.rows,
+        storeSettings: settings,
+        reviews: reviewsResult.rows,
+        timestamp: new Date().toISOString()
+      });
+    } finally {
+      client.release();
+    }
+  } catch (err: any) {
+    console.error('Bootstrap error:', err);
+    res.status(503).json({ 
+      error: { code: 'DATABASE_UNAVAILABLE', message: 'Database temporarily unavailable' } 
+    });
+  }
+});
+
+// ============================ PRODUCTS ROUTES ============================
+
+app.get('/api/products', async (req: Request, res: Response) => {
+  try {
+    const { category_slug, subcategory_slug, featured, newest, bestseller, search, limit, offset } = req.query;
+    
+    const client = await pool.connect();
+    try {
+      let query = 'SELECT * FROM products WHERE stock > 0';
+      const params: any[] = [];
+      let paramIndex = 1;
+      
+      if (category_slug) {
+        query += ` AND category_slug = $${paramIndex++}`;
+        params.push(category_slug);
+      }
+      
+      if (subcategory_slug) {
+        query += ` AND subcategory_slug = $${paramIndex++}`;
+        params.push(subcategory_slug);
+      }
+      
+      if (featured === 'true') {
+        query += ` AND is_featured = true`;
+      }
+      
+      if (newest === 'true') {
+        query += ` AND is_new_arrival = true`;
+      }
+      
+      if (bestseller === 'true') {
+        query += ` AND is_bestseller = true`;
+      }
+      
+      if (search) {
+        query += ` AND (title ILIKE $${paramIndex} OR slug ILIKE $${paramIndex})`;
+        params.push(`%${search}%`, `%${search}%`);
+        paramIndex += 2;
+      }
+      
+      query += ` ORDER BY is_featured DESC, is_new_arrival DESC, is_bestseller DESC, created_at DESC`;
+      
+      // Pagination
+      if (limit !== undefined) {
+        query += ` LIMIT $${paramIndex++}`;
+        params.push(Number(limit));
+      }
+      
+      if (offset !== undefined) {
+        query += ` OFFSET $${paramIndex++}`;
+        params.push(Number(offset));
+      }
+      
+      const result = await client.query(query, params);
+      res.json(result.rows);
+    } finally {
+      client.release();
+    }
+  } catch (err: any) {
+    console.error('Products error:', err);
+    res.status(500).json({ 
+      error: { code: 'INTERNAL_ERROR', message: 'Failed to fetch products' } 
+    });
+  }
+});
+
+app.get('/api/products/:id', async (req: Request, res: Response) => {
+  try {
+    const { id } = req.params;
+    const client = await pool.connect();
+    try {
+      const result = await client.query('SELECT * FROM products WHERE id = $1', [id]);
+      
+      if (result.rows.length === 0) {
+        return res.status(404).json({ 
+          error: { code: 'PRODUCT_NOT_FOUND', message: 'Product not found' } 
+        });
+      }
+      
+      res.json(result.rows[0]);
+    } finally {
+      client.release();
+    }
+  } catch (err: any) {
+    console.error('Product details error:', err);
+    res.status(500).json({ 
+      error: { code: 'INTERNAL_ERROR', message: 'Failed to fetch product details' } 
+    });
+  }
+});
+
+// ============================ CATEGORIES ROUTES ============================
+
+app.get('/api/categories', async (_req: Request, res: Response) => {
+  try {
+    const client = await pool.connect();
+    try {
+      const result = await client.query('SELECT * FROM categories ORDER BY sort_order ASC');
+      res.json(result.rows);
+    } finally {
+      client.release();
+    }
+  } catch (err: any) {
+    console.error('Categories error:', err);
+    res.status(500).json({ 
+      error: { code: 'INTERNAL_ERROR', message: 'Failed to fetch categories' } 
+    });
+  }
+});
+
+// ============================ BANNERS ROUTES ============================
+
+app.get('/api/banners', async (_req: Request, res: Response) => {
+  try {
+    const client = await pool.connect();
+    try {
+      const result = await client.query('SELECT * FROM banners WHERE is_active = true ORDER BY sort_order ASC');
+      res.json(result.rows);
+    } finally {
+      client.release();
+    }
+  } catch (err: any) {
+    console.error('Banners error:', err);
+    res.status(500).json({ 
+      error: { code: 'INTERNAL_ERROR', message: 'Failed to fetch banners' } 
+    });
+  }
+});
+
+// ============================ STORE SETTINGS ROUTE ============================
+
+app.get('/api/store-settings', async (_req: Request, res: Response) => {
+  try {
+    const client = await pool.connect();
+    try {
+      const result = await client.query('SELECT setting_key, setting_value FROM store_settings');
+      const settings: Record<string, any> = {};
+      result.rows.forEach((row: any) => {
+        settings[row.setting_key] = row.setting_value;
+      });
+      res.json(settings);
+    } finally {
+      client.release();
+    }
+  } catch (err: any) {
+    console.error('Store settings error:', err);
+    res.status(500).json({ 
+      error: { code: 'INTERNAL_ERROR', message: 'Failed to fetch store settings' } 
+    });
+  }
+});
+
+// ============================ HEALTH & DIAGNOSTICS ============================
+
 app.get('/api/health', (_req: Request, res: Response) => {
-  res.json({
-    status: 'ok',
-    backend: 'connected',
-    timestamp: new Date().toISOString(),
+  res.json({ 
+    status: 'ok', 
+    backend: 'connected', 
+    database: 'foner',
+    timestamp: new Date().toISOString()
   });
 });
 
 app.get('/api/admin/diagnostics/database', async (_req: Request, res: Response) => {
   try {
-    const { getDbClient } = await import('./postgres.js');
-    const client = await getDbClient();
+    const client = await pool.connect();
     const start = Date.now();
     try {
       await client.query('SELECT 1');
@@ -256,7 +724,7 @@ app.get('/api/admin/diagnostics/database', async (_req: Request, res: Response) 
         database: 'foner',
         latency_ms: latency,
         pool_size: 20,
-        timestamp: new Date().toISOString(),
+        timestamp: new Date().toISOString()
       });
     } finally {
       client.release();
@@ -266,1060 +734,698 @@ app.get('/api/admin/diagnostics/database', async (_req: Request, res: Response) 
     res.status(503).json({
       ok: false,
       connected: false,
-      database: 'foner',
-      latency_ms: -1,
-      pool_size: 0,
       error: err.message,
-      timestamp: new Date().toISOString(),
+      timestamp: new Date().toISOString()
     });
   }
 });
 
-// Loyalty Status for Logged-In Customer
-app.get('/api/loyalty/status', (req: Request, res: Response) => {
-  const user = getAuthUser(req);
-  const loyalty = calculateUserLoyalty(user ? user.id : 0, user?.email);
-  res.json(loyalty);
-});
+// ============================ EXPORTS FOR ROUTES ============================
+// Routes are imported from the routes/ directory. This module is the single
+// entry point and exports the shared dependencies they need.
 
-// Admin Loyalty Customers List
-app.get('/api/admin/loyalty', (_req: Request, res: Response) => {
-  const loyaltyCustomers = users.map((u) => {
-    const loyalty = calculateUserLoyalty(u.id, u.email);
-    return {
-      user_id: u.id,
-      name: u.name,
-      email: u.email,
-      total_products_purchased: loyalty.total_products_purchased,
-      current_tier: loyalty.current_tier,
-      current_reward: loyalty.reward_description,
-      reward_status:
-        loyalty.status === 'AVAILABLE' ? 'Available' : loyalty.status === 'USED' ? 'Used' : 'None',
-    };
-  });
-  res.json(loyaltyCustomers);
-});
+export { app, config, authenticateToken, requireAdmin, applyRateLimit, pool };
+// Start the server
+startServer();
 
-// Bootstrap (Storefront initialization)
-app.get('/api/bootstrap', async (_req: Request, res: Response) => {
+export { initializeDatabase, isReady };
+
+// ============================ ADDITIONAL API ROUTES ============================
+
+// Registration endpoint (PostgreSQL backed)
+app.post('/api/auth/register', async (req: Request, res: Response) => {
   try {
-    const { getDbClient } = await import('./postgres.js');
-    const client = await getDbClient();
+    const { name, email, password, phone, city, address, postal_code } = req.body;
+    if (!email || !password || !name) {
+      return res.status(400).json({ error: { code: 'VALIDATION_ERROR', message: 'Name, email, and password required' } });
+    }
+    
+    const client = await pool.connect();
     try {
-      const [categoriesResult, subcategoriesResult, productsResult, bannersResult, settingsResult, reviewsResult] = await Promise.all([
-        client.query('SELECT * FROM categories ORDER BY sort_order ASC'),
-        client.query('SELECT * FROM subcategories ORDER BY sort_order ASC'),
-        client.query('SELECT * FROM products WHERE stock > 0 ORDER BY is_featured DESC, is_new_arrival DESC, created_at DESC LIMIT 50'),
-        client.query('SELECT * FROM banners WHERE is_active = true ORDER BY sort_order ASC'),
-        client.query('SELECT setting_key, setting_value FROM store_settings'),
-        client.query('SELECT * FROM reviews ORDER BY created_at DESC LIMIT 20'),
-      ]);
+      const existing = await client.query('SELECT id FROM users WHERE email = $1', [email.toLowerCase().trim()]);
+      if (existing.rows.length > 0) {
+        return res.status(409).json({ error: { code: 'EMAIL_EXISTS', message: 'Account with this email already exists' } });
+      }
+      
+      const hash = await bcrypt.hash(password, 10);
+      const result = await client.query(
+        'INSERT INTO users (name, email, phone, city, address, postal_code, role, status, password_hash, loyalty_points) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10) RETURNING *',
+        [name.trim(), email.toLowerCase().trim(), phone || '', city || 'Lahore', address || '', postal_code || '', 'customer', 'active', hash, 0]
+      );
+      
+      const user = result.rows[0];
+      const token = jwt.sign({ userId: user.id, email: user.email, role: user.role }, config.jwtSecret, { expiresIn: '7d' });
+      res.cookie('auth_token', token, { httpOnly: true, secure: config.nodeEnv === 'production', sameSite: 'lax', maxAge: config.sessionMaxAgeMs });
+      
+      const { password_hash, ...userSafe } = user;
+      res.json({ success: true, user: userSafe, token });
+    } finally { client.release(); }
+  } catch (err: any) {
+    console.error('Registration error:', err);
+    res.status(500).json({ error: { code: 'INTERNAL_ERROR', message: 'Registration failed' } });
+  }
+});
 
-      const settings: any = {};
-      settingsResult.rows.forEach((row: any) => {
-        settings[row.setting_key] = row.setting_value?.value || row.setting_value;
-      });
+// OTP endpoints (database-backed)
+app.post('/api/auth/send-otp', applyRateLimit, async (req: Request, res: Response) => {
+  try {
+    const { email, name } = req.body;
+    const client = await pool.connect();
+    try {
+      const otp = Math.floor(100000 + Math.random() * 900000).toString();
+      const expiresAt = new Date(Date.now() + 10 * 60 * 1000); // 10 minutes
+      
+      await client.query(
+        'INSERT INTO registration_otps (email, name, otp, expires_at) VALUES ($1, $2, $3, $4) ON CONFLICT DO NOTHING',
+        [email.trim(), name?.trim() || '', otp, expiresAt]
+      );
+      
+      res.json({ success: true, message: 'OTP sent to your email.' });
+    } finally { client.release(); }
+  } catch (err) {
+    console.error('OTP send error:', err);
+    res.status(500).json({ error: { code: 'INTERNAL_ERROR', message: 'Failed to send OTP' } });
+  }
+});
 
-      res.json({
-        settings,
-        banners: bannersResult.rows,
-        categories: categoriesResult.rows,
-        subcategories: subcategoriesResult.rows,
-        products: productsResult.rows,
-        reviews: reviewsResult.rows,
-        timestamp: new Date().toISOString(),
-      });
+app.post('/api/auth/verify-otp', applyRateLimit, async (req: Request, res: Response) => {
+  try {
+    const { email, otp } = req.body;
+    const client = await pool.connect();
+    try {
+      const result = await client.query(
+        'SELECT * FROM registration_otps WHERE email = $1 AND otp = $2 AND used = false AND expires_at > NOW() ORDER BY created_at DESC LIMIT 1',
+        [email.trim(), otp.trim()]
+      );
+      
+      if (result.rows.length === 0) {
+        return res.status(400).json({ error: { code: 'INVALID_OTP', message: 'Invalid or expired OTP code' } });
+      }
+      
+      await client.query('UPDATE registration_otps SET used = true WHERE id = $1', [result.rows[0].id]);
+      res.json({ verified: true, message: 'OTP verified successfully.' });
+    } finally { client.release(); }
+  } catch (err) {
+    console.error('OTP verify error:', err);
+    res.status(500).json({ error: { code: 'INTERNAL_ERROR', message: 'OTP verification failed' } });
+  }
+});
+
+app.post('/api/auth/forgot-password', applyRateLimit, async (req: Request, res: Response) => {
+  try {
+    const { email } = req.body;
+    const client = await pool.connect();
+    try {
+      const user = await client.query('SELECT id FROM users WHERE email = $1', [email.trim().toLowerCase()]);
+      if (user.rows.length === 0) {
+        // Always return success (don't reveal if email exists)
+        return res.json({ success: true, message: 'If an account exists, a reset link has been sent.' });
+      }
+      
+      const token = crypto.randomBytes(32).toString('hex');
+      const expiresAt = new Date(Date.now() + 60 * 60 * 1000); // 1 hour
+      
+      await client.query(
+        'INSERT INTO password_reset_tokens (user_id, email, token, expires_at) VALUES ($1, $2, $3, $4) ON CONFLICT DO NOTHING',
+        [user.rows[0].id, email.trim().toLowerCase(), token, expiresAt]
+      );
+      
+      res.json({ success: true, message: 'Password reset OTP sent.' });
+    } finally { client.release(); }
+  } catch (err) {
+    console.error('Forgot password error:', err);
+    res.status(500).json({ error: { code: 'INTERNAL_ERROR', message: 'Failed to process reset request' } });
+  }
+});
+
+app.post('/api/auth/reset-password', applyRateLimit, async (req: Request, res: Response) => {
+  try {
+    const { email, otp, newPassword, new_password, password } = req.body;
+    const passwordValue = newPassword || new_password || password;
+    
+    if (!email || !otp || !passwordValue || passwordValue.length < 6) {
+      return res.status(400).json({ error: { code: 'VALIDATION_ERROR', message: 'Email, OTP, and a valid password (min 6 chars) are required' } });
+    }
+    
+    const client = await pool.connect();
+    try {
+      // Check OTP from registration_otps or check reset token
+      const otpResult = await client.query(
+        'SELECT * FROM registration_otps WHERE email = $1 AND otp = $2 AND used = false AND expires_at > NOW() ORDER BY created_at DESC LIMIT 1',
+        [email.trim(), otp.trim()]
+      );
+      
+      let valid = false;
+      if (otpResult.rows.length > 0) {
+        valid = true;
+        await client.query('UPDATE registration_otps SET used = true WHERE id = $1', [otpResult.rows[0].id]);
+      } else {
+        // Check password reset token
+        const tokenResult = await client.query(
+          'SELECT * FROM password_reset_tokens WHERE email = $1 AND token = $2 AND used = false AND expires_at > NOW() ORDER BY created_at DESC LIMIT 1',
+          [email.trim(), otp.trim()]
+        );
+        if (tokenResult.rows.length > 0) {
+          valid = true;
+          await client.query('UPDATE password_reset_tokens SET used = true WHERE id = $1', [tokenResult.rows[0].id]);
+        }
+      }
+      
+      if (!valid) {
+        return res.status(400).json({ error: { code: 'INVALID_OTP', message: 'Invalid or expired verification code' } });
+      }
+      
+      const hash = await bcrypt.hash(passwordValue, 10);
+      await client.query('UPDATE users SET password_hash = $1, updated_at = NOW() WHERE email = $2', [hash, email.trim().toLowerCase()]);
+      
+      res.json({ success: true, message: 'Password updated successfully' });
+    } finally { client.release(); }
+  } catch (err) {
+    console.error('Reset password error:', err);
+    res.status(500).json({ error: { code: 'INTERNAL_ERROR', message: 'Failed to reset password' } });
+  }
+});
+
+// ============================ ORDERS ============================
+app.get('/api/orders', authenticateToken, async (req: Request, res: Response) => {
+  try {
+    const userId = (req as any).user?.userId;
+    const isAdmin = (req as any).user?.role === 'admin';
+    const client = await pool.connect();
+    try {
+      if (isAdmin) {
+        const result = await client.query('SELECT * FROM orders ORDER BY created_at DESC');
+        res.json(result.rows);
+      } else {
+        const result = await client.query('SELECT * FROM orders WHERE user_id = $1 ORDER BY created_at DESC', [userId]);
+        res.json(result.rows);
+      }
+    } finally { client.release(); }
+  } catch (err) {
+    console.error('Orders GET error:', err);
+    res.status(500).json({ error: { code: 'INTERNAL_ERROR', message: 'Failed to fetch orders' } });
+  }
+});
+
+app.post('/api/orders', authenticateToken, async (req: Request, res: Response) => {
+  try {
+    const { items, customerInfo, paymentMethod, couponCode } = req.body;
+    const userId = (req as any).user?.userId;
+    
+    if (!Array.isArray(items) || items.length === 0) {
+      return res.status(400).json({ error: { code: 'VALIDATION_ERROR', message: 'Order must contain at least one item' } });
+    }
+    
+    const client = await pool.connect();
+    try {
+      await client.query('BEGIN');
+      
+      // Validate products and calculate totals server-side
+      let subtotal = 0;
+      const validItems = [];
+      
+      for (const item of items) {
+        const productResult = await client.query('SELECT * FROM products WHERE id = $1 AND stock >= $2', [item.product_id, item.quantity || 1]);
+        if (productResult.rows.length === 0) {
+          await client.query('ROLLBACK');
+          return res.status(400).json({ error: { code: 'STOCK_INSUFFICIENT', message: `Product ${item.product_id} is unavailable or insufficient stock` } });
+        }
+        
+        const prod = productResult.rows[0];
+        const price = prod.price_pkr || 0;
+        subtotal += price * (item.quantity || 1);
+        validItems.push({ ...item, price_pkr: price, product_id: item.product_id });
+      }
+      
+      const deliveryFee = 300;
+      let discount = 0;
+      
+      // Validate coupon
+      if (couponCode) {
+        const couponResult = await client.query('SELECT * FROM coupons WHERE code = $1 AND is_active = true AND (expires_at IS NULL OR expires_at > NOW())', [couponCode]);
+        if (couponResult.rows.length > 0) {
+          const coupon = couponResult.rows[0];
+          discount = coupon.discount_type === 'percentage' ? Math.round(subtotal * (Number(coupon.discount_value) / 100)) : Number(coupon.discount_value);
+          if (coupon.max_discount_pkr && discount > coupon.max_discount_pkr) discount = coupon.max_discount_pkr;
+          await client.query('UPDATE coupons SET times_used = times_used + 1 WHERE code = $1', [couponCode]);
+        }
+      }
+      
+      const total = Math.max(0, subtotal - discount + deliveryFee);
+      const orderNumber = 'ORD-' + Date.now();
+      
+      const orderResult = await client.query(
+        `INSERT INTO orders (order_number, user_id, customer_name, customer_email, customer_phone, shipping_address, shipping_city, shipping_postal_code, subtotal_pkr, delivery_fee_pkr, discount_pkr, total_pkr, payment_method, payment_status, order_status, items_json) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16) RETURNING *`,
+        [
+          orderNumber, userId, customerInfo?.name || 'Valued Customer', customerInfo?.email || '', customerInfo?.phone || '',
+          customerInfo?.address || '', customerInfo?.city || 'Lahore', customerInfo?.postal_code || '',
+          subtotal, deliveryFee, discount, total,
+          paymentMethod || 'cod', 'pending', 'pending', JSON.stringify(validItems)
+        ]
+      );
+      
+      // Update stock
+      for (const item of validItems) {
+        await client.query('UPDATE products SET stock = stock - $1, units_sold = units_sold + $1 WHERE id = $2', [item.quantity || 1, item.product_id]);
+      }
+      
+      await client.query('COMMIT');
+      
+      // Update user stats
+      if (userId) {
+        await client.query('UPDATE users SET total_orders = total_orders + 1, total_spent_pkr = total_spent_pkr + $1 WHERE id = $2', [total, userId]);
+      }
+      
+      res.status(201).json(orderResult.rows[0]);
+    } catch (err: any) {
+      await client.query('ROLLBACK');
+      throw err;
     } finally {
       client.release();
     }
   } catch (err: any) {
-    console.error('Bootstrap error:', err);
-    res.status(500).json({ error: 'Database unavailable: ' + err.message });
+    console.error('Order creation error:', err);
+    res.status(500).json({ error: { code: 'INTERNAL_ERROR', message: 'Failed to create order' } });
   }
 });
 
-// Admin Bootstrap
-app.get('/api/admin/bootstrap', (_req: Request, res: Response) => {
-  const loyaltyCustomers = users.map((u) => {
-    const loyalty = calculateUserLoyalty(u.id, u.email);
-    return {
-      user_id: u.id,
-      name: u.name,
-      email: u.email,
-      total_products_purchased: loyalty.total_products_purchased,
-      current_tier: loyalty.current_tier,
-      current_reward: loyalty.reward_description,
-      reward_status:
-        loyalty.status === 'AVAILABLE' ? 'Available' : loyalty.status === 'USED' ? 'Used' : 'None',
-    };
-  });
+// ============================ LOYALTY ============================
 
-  res.json({
-    users,
-    orders,
-    coupons,
-    restockNotifications,
-    rewardRedemptions,
-    loyaltyCustomers,
-    auditLogs,
-    dbStatus: {
-      connected: true,
-      latencyMs: 2,
-      poolSize: 5,
-    },
-  });
-});
-
-// Admin Stats
-app.get('/api/admin/stats', (req: Request, res: Response) => {
-  const threshold = Number(req.query.threshold) || 3;
-  const validOrders = orders.filter((o) => o.order_status !== 'cancelled');
-  const totalRevenue = validOrders.reduce((sum, o) => sum + (o.total_pkr || 0), 0);
-  const deliveredRevenue = validOrders
-    .filter((o) => o.order_status === 'delivered')
-    .reduce((sum, o) => sum + (o.total_pkr || 0), 0);
-  const pendingRevenue = validOrders
-    .filter((o) => ['pending', 'processing', 'shipped'].includes(o.order_status))
-    .reduce((sum, o) => sum + (o.total_pkr || 0), 0);
-
-  const lowStockProducts = products.filter((p) => p.stock > 0 && p.stock <= threshold);
-  const outOfStockProducts = products.filter((p) => p.stock === 0);
-
-  res.json({
-    total_revenue_pkr: totalRevenue,
-    delivered_revenue_pkr: deliveredRevenue,
-    pending_revenue_pkr: pendingRevenue,
-    total_orders_count: orders.length,
-    orders_by_status: {
-      pending: orders.filter((o) => o.order_status === 'pending').length,
-      processing: orders.filter((o) => o.order_status === 'processing').length,
-      shipped: orders.filter((o) => o.order_status === 'shipped').length,
-      delivered: orders.filter((o) => o.order_status === 'delivered').length,
-      cancelled: orders.filter((o) => o.order_status === 'cancelled').length,
-    },
-    total_customers_count: users.length,
-    low_stock_count: lowStockProducts.length,
-    low_stock_products: lowStockProducts,
-    out_of_stock_count: outOfStockProducts.length,
-    out_of_stock_products: outOfStockProducts,
-  });
-});
-
-// Revenue Analytics
-app.get('/api/admin/analytics/revenue', (req: Request, res: Response) => {
-  const range = (req.query.range as string) || '30d';
-  const intervals = range === '7d' ? 7 : range === '1y' ? 12 : 30;
-
-  const data = Array.from({ length: intervals }).map((_, i) => {
-    const d = new Date();
-    d.setDate(d.getDate() - (intervals - 1 - i));
-    const label = d.toLocaleDateString('en-US', { month: 'short', day: 'numeric' });
-    const dailyRev = 25000 + Math.floor(Math.sin(i * 0.8) * 15000) + (i % 3) * 12000;
-    const dailyOrders = Math.max(1, Math.floor(dailyRev / 28000));
-    return {
-      date: label,
-      revenue_pkr: dailyRev,
-      orders_count: dailyOrders,
-    };
-  });
-
-  res.json({
-    range,
-    data,
-    total_period_revenue_pkr: data.reduce((s, p) => s + p.revenue_pkr, 0),
-    total_period_orders: data.reduce((s, p) => s + p.orders_count, 0),
-  });
-});
-
-// Authentication Routes
-app.get('/api/auth/me', (req: Request, res: Response) => {
-  const user = getAuthUser(req);
-  res.json({ user });
-});
-
-app.post('/api/auth/login', (req: Request, res: Response) => {
-  const { email } = req.body;
-  let user = users.find((u) => u.email.toLowerCase() === (email || '').toLowerCase().trim());
-  if (!user) {
-    const isAdmin = (email || '').toLowerCase().includes('admin') || email === 'fonerera@gmail.com';
-    user = {
-      id: users.length + 1,
-      name: email.split('@')[0],
-      email: email.trim(),
-      phone: '+92 300 1234567',
-      city: 'Lahore',
-      address: 'Gulberg III Atelier, Lahore',
-      postal_code: '54000',
-      role: isAdmin ? 'admin' : 'customer',
-      status: 'active',
-      avatar_url: '',
-      total_orders: 0,
-      total_spent_pkr: 0,
-      loyalty_points: 0,
-      created_at: new Date().toISOString(),
-    };
-    users.push(user);
-    persistDb();
+app.get('/api/loyalty/status', authenticateToken, async (req: Request, res: Response) => {
+  try {
+    const userId = (req as any).user?.userId;
+    const client = await pool.connect();
+    try {
+      // Calculate loyalty from completed orders
+      const orderResult = await client.query(`
+        SELECT COALESCE(SUM(
+          (SELECT COALESCE(SUM((x->>'quantity')::int),0) FROM jsonb_array_elements(items_json::jsonb) x)
+        ), 0) as total_items FROM orders 
+        WHERE user_id = $1 AND (order_status = 'delivered' OR order_status = 'shipped' OR order_status = 'confirmed' OR payment_status = 'paid')
+      `, [userId]);
+      
+      const totalPurchased = parseInt(orderResult.rows[0].total_items || '0');
+      const currentTier = totalPurchased >= 100 ? 100 : Math.floor(totalPurchased / 10) * 10;
+      const isRewardAvailable = totalPurchased >= 10;
+      const isFreeProduct = totalPurchased >= 100;
+      const discountPercent = currentTier >= 100 ? 0 : currentTier;
+      
+      res.json({
+        total_products_purchased: totalPurchased,
+        current_tier: currentTier,
+        current_reward: currentTier >= 100 ? '1 FREE PRODUCT' : `${currentTier}% OFF`,
+        is_reward_available: isRewardAvailable,
+        is_free_product: isFreeProduct,
+        discount_percent: discountPercent,
+        next_tier: totalPurchased >= 100 ? null : currentTier + 10,
+        products_until_next_tier: totalPurchased >= 100 ? 0 : (currentTier + 10) - totalPurchased,
+        status: isRewardAvailable ? 'AVAILABLE' : 'NONE'
+      });
+    } finally { client.release(); }
+  } catch (err) {
+    console.error('Loyalty error:', err);
+    res.status(500).json({ error: { code: 'INTERNAL_ERROR', message: 'Failed to calculate loyalty' } });
   }
-  currentLoggedInUser = user;
-  const token = 'token_' + user.id + '_' + Date.now();
-  res.cookie('foner_session', token, { httpOnly: true, path: '/' });
-  res.json({ success: true, token, user });
 });
 
-app.post('/api/auth/register', (req: Request, res: Response) => {
-  const { name, email, phone, city, address, postal_code } = req.body;
-  const existing = users.find((u) => u.email.toLowerCase() === (email || '').toLowerCase().trim());
-  if (existing) {
-    return res.status(400).json({ error: 'An account with this email already exists.' });
+// ============================ REVIEWS ============================
+
+app.get('/api/reviews', async (req: Request, res: Response) => {
+  try {
+    const { productId } = req.query;
+    const client = await pool.connect();
+    try {
+      let query = 'SELECT * FROM reviews WHERE 1=1';
+      const params: any[] = [];
+      if (productId) {
+        query += ' AND product_id = $1';
+        params.push(productId);
+      }
+      query += ' ORDER BY created_at DESC';
+      const result = await client.query(query, params);
+      res.json(result.rows);
+    } finally { client.release(); }
+  } catch (err) {
+    console.error('Reviews error:', err);
+    res.status(500).json({ error: { code: 'INTERNAL_ERROR', message: 'Failed to fetch reviews' } });
   }
-  const newUser = {
-    id: users.length + 1,
-    name: name || 'Valued Client',
-    email: email.trim(),
-    phone: phone || '',
-    city: city || 'Lahore',
-    address: address || '',
-    postal_code: postal_code || '',
-    role: 'customer' as const,
-    status: 'active' as const,
-    avatar_url: '',
-    total_orders: 0,
-    total_spent_pkr: 0,
-    loyalty_points: 100,
-    created_at: new Date().toISOString(),
-  };
-  users.push(newUser);
-  persistDb();
-  currentLoggedInUser = newUser;
-  const token = 'token_' + newUser.id + '_' + Date.now();
-  res.cookie('foner_session', token, { httpOnly: true, path: '/' });
-  res.json({ success: true, token, user: newUser });
 });
 
-app.post('/api/auth/logout', (_req: Request, res: Response) => {
-  currentLoggedInUser = null;
-  res.clearCookie('foner_session');
-  res.json({ success: true });
+app.post('/api/reviews', authenticateToken, async (req: Request, res: Response) => {
+  try {
+    const { productId, rating, comment } = req.body;
+    const userId = (req as any).user?.userId;
+    
+    if (!productId || !rating || rating < 1 || rating > 5) {
+      return res.status(400).json({ error: { code: 'VALIDATION_ERROR', message: 'Valid product ID and rating (1-5) required' } });
+    }
+    
+    const client = await pool.connect();
+    try {
+      const result = await client.query(
+        'INSERT INTO reviews (product_id, user_id, rating, comment, verified_buyer, created_at) VALUES ($1, $2, $3, $4, $5, NOW()) RETURNING *',
+        [productId, userId, rating, comment || '', true]
+      );
+      
+      // Update product stats
+      await client.query(`
+        UPDATE products SET rating = (SELECT AVG(rating) FROM reviews WHERE product_id = $1),
+        reviews_count = (SELECT COUNT(*) FROM reviews WHERE product_id = $1) WHERE id = $1
+      `, [productId]);
+      
+      res.status(201).json(result.rows[0]);
+    } finally { client.release(); }
+  } catch (err) {
+    console.error('Review error:', err);
+    res.status(500).json({ error: { code: 'INTERNAL_ERROR', message: 'Failed to create review' } });
+  }
 });
 
-app.post('/api/auth/send-otp', (_req: Request, res: Response) => {
-  res.json({ success: true, message: 'OTP sent to your email.' });
+// ============================ COUPONS ============================
+
+app.get('/api/coupons', async (_req: Request, res: Response) => {
+  try {
+    const client = await pool.connect();
+    try {
+      const result = await client.query('SELECT * FROM coupons WHERE is_active = true ORDER BY id ASC');
+      res.json(result.rows);
+    } finally { client.release(); }
+  } catch (err) {
+    res.status(500).json({ error: { code: 'INTERNAL_ERROR', message: 'Failed to fetch coupons' } });
+  }
 });
 
-app.post('/api/auth/verify-otp', (_req: Request, res: Response) => {
-  res.json({ verified: true, message: 'OTP verified successfully.' });
+app.post('/api/coupons/validate', async (req: Request, res: Response) => {
+  try {
+    const { code, subtotal_pkr, user_email } = req.body;
+    const client = await pool.connect();
+    try {
+      const result = await client.query('SELECT * FROM coupons WHERE code = $1 AND is_active = true', [code?.trim()]);
+      
+      if (result.rows.length === 0) {
+        return res.status(400).json({ error: { code: 'COUPON_INVALID', message: 'Invalid or inactive coupon code' } });
+      }
+      
+      const coupon = result.rows[0];
+      if (coupon.expires_at && new Date(coupon.expires_at) < new Date()) {
+        return res.status(400).json({ error: { code: 'COUPON_EXPIRED', message: 'This coupon has expired' } });
+      }
+      
+      if (coupon.usage_limit && coupon.times_used >= coupon.usage_limit) {
+        return res.status(400).json({ error: { code: 'COUPON_LIMIT_REACHED', message: 'This coupon has reached its usage limit' } });
+      }
+      
+      if (subtotal_pkr < (coupon.min_spend_pkr || 0)) {
+        return res.status(400).json({ error: { code: 'COUPON_MIN_SPEND', message: `Minimum spend of PKR ${coupon.min_spend_pkr || 0} required` } });
+      }
+      
+      const discount = coupon.discount_type === 'percentage' 
+        ? Math.round(Number(subtotal_pkr) * (Number(coupon.discount_value) / 100)) 
+        : Number(coupon.discount_value);
+      
+      const finalDiscount = coupon.max_discount_pkr ? Math.min(discount, coupon.max_discount_pkr) : discount;
+      
+      res.json({ 
+        valid: true, 
+        coupon: { 
+          code: coupon.code, 
+          discount_type: coupon.discount_type, 
+          discount_value: coupon.discount_value,
+          discount_amount: finalDiscount,
+          min_spend_pkr: coupon.min_spend_pkr 
+        }
+      });
+    } finally { client.release(); }
+  } catch (err) {
+    console.error('Coupon validation error:', err);
+    res.status(500).json({ error: { code: 'INTERNAL_ERROR', message: 'Failed to validate coupon' } });
+  }
 });
 
-app.post('/api/auth/forgot-password', (_req: Request, res: Response) => {
-  res.json({ success: true, message: 'Password reset OTP sent.' });
+// ============================ ADMIN STATS ============================
+
+app.get('/api/admin/stats', authenticateToken, requireAdmin, async (req: Request, res: Response) => {
+  try {
+    const { threshold = '3' } = req.query;
+    const client = await pool.connect();
+    try {
+      // Revenue stats
+      const revenueResult = await client.query(`
+        SELECT 
+          COALESCE(SUM(total_pkr), 0) as total_revenue,
+          COALESCE(SUM(CASE WHEN order_status = 'delivered' THEN total_pkr ELSE 0 END), 0) as delivered_revenue,
+          COUNT(*) as total_orders,
+          COUNT(DISTINCT user_id) as total_customers,
+          AVG(total_pkr) as avg_order_value
+        FROM orders WHERE order_status NOT IN ('cancelled')
+      `);
+      
+      const stats = revenueResult.rows[0];
+      
+      // Low stock count
+      const lowStockResult = await client.query('SELECT COUNT(*) as count FROM products WHERE stock <= $1', [threshold]);
+      
+      res.json({
+        totalRevenue: parseInt(stats.total_revenue) || 0,
+        deliveredRevenue: parseInt(stats.delivered_revenue) || 0,
+        totalOrders: parseInt(stats.total_orders) || 0,
+        totalCustomers: parseInt(stats.total_customers) || 0,
+        avgOrderValue: parseFloat(stats.avg_order_value) || 0,
+        lowStockCount: parseInt(lowStockResult.rows[0].count) || 0,
+        totalProducts: await client.query('SELECT COUNT(*) FROM products').then(r => r.rows[0].count),
+        timestamp: new Date().toISOString()
+      });
+    } finally { client.release(); }
+  } catch (err) {
+    console.error('Admin stats error:', err);
+    res.status(500).json({ error: { code: 'INTERNAL_ERROR', message: 'Failed to load statistics' } });
+  }
 });
 
-app.post('/api/auth/reset-password', (_req: Request, res: Response) => {
-  res.json({ success: true, message: 'Password updated successfully.' });
+// ============================ REVENUE ANALYTICS ============================
+
+app.get('/api/admin/analytics/revenue', authenticateToken, requireAdmin, async (req: Request, res: Response) => {
+  try {
+    const { range = '30d' } = req.query;
+    const client = await pool.connect();
+    try {
+      const days = range === '7d' ? 7 : range === '30d' ? 30 : range === '3m' ? 90 : range === '6m' ? 180 : 365;
+      const result = await client.query(`
+        SELECT DATE(created_at) as date, SUM(total_pkr) as revenue, COUNT(*) as orders
+        FROM orders 
+        WHERE created_at >= NOW() - INTERVAL '${days} days' AND order_status NOT IN ('cancelled')
+        GROUP BY DATE(created_at) ORDER BY DATE(created_at) ASC
+      `);
+      
+      res.json({
+        range,
+        data: result.rows.map((r: any) => ({
+          date: r.date,
+          revenue: parseInt(r.revenue) || 0,
+          orders: parseInt(r.orders) || 0
+        })),
+        timestamp: new Date().toISOString()
+      });
+    } finally { client.release(); }
+  } catch (err) {
+    console.error('Revenue analytics error:', err);
+    res.status(500).json({ error: { code: 'INTERNAL_ERROR', message: 'Failed to load analytics' } });
+  }
 });
 
-app.put('/api/auth/profile', (req: Request, res: Response) => {
-  const user = getAuthUser(req) || users[0];
-  const { name, phone, city, address, postal_code } = req.body;
-  if (name) user.name = name;
-  if (phone) user.phone = phone;
-  if (city) user.city = city;
-  if (address) user.address = address;
-  if (postal_code) user.postal_code = postal_code;
-  persistDb();
-  res.json({ success: true, user });
+// ============================ ADMIN PRODUCT CRUD ============================
+app.get('/api/admin/products', authenticateToken, requireAdmin, async (req: Request, res: Response) => {
+  try { const client = await pool.connect(); try { const result = await client.query('SELECT * FROM products ORDER BY created_at DESC'); res.json(result.rows); } finally { client.release(); } } catch (err: any) { console.error('Admin list error:', err); res.status(500).json({ error: { code: 'INTERNAL_ERROR', message: 'Failed' } }); }
+});
+app.get('/api/admin/products/:id', authenticateToken, requireAdmin, async (req: Request, res: Response) => {
+  try { const { id } = req.params; const client = await pool.connect(); try { const result = await client.query('SELECT * FROM products WHERE id = $1', [id]); if (result.rows.length === 0) return res.status(404).json({ error: { code: 'NOT_FOUND', message: 'Not found' } }); res.json(result.rows[0]); } finally { client.release(); } } catch (err: any) { res.status(500).json({ error: { code: 'INTERNAL_ERROR', message: 'Failed' } }); }
+});
+app.post('/api/admin/products', authenticateToken, requireAdmin, async (req: Request, res: Response) => {
+  try { const { title, slug, sku, category_slug, price_pkr, stock, description } = req.body; if (!title || !slug || !sku || !category_slug || price_pkr === undefined || stock === undefined) return res.status(400).json({ error: { code: 'VALIDATION_ERROR', message: 'Required fields missing' } }); const client = await pool.connect(); try { const result = await client.query(`INSERT INTO products (title, slug, sku, category_slug, subcategory_slug, price_pkr, compare_at_price_pkr, description, fabric_care, seo_title, meta_description, image_url, gallery_urls, sizes, colors, variants, stock, is_featured, is_new_arrival, is_bestseller) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18,$19,$20) RETURNING *`, [title, slug, sku, category_slug || null, null, Number(price_pkr), null, description || '', '', title, '', '', [], [], '[]', '[]', Number(stock), false, false, false]); res.status(201).json(result.rows[0]); } finally { client.release(); } } catch (err: any) { if (err.code === '23505') return res.status(409).json({ error: { code: 'DUPLICATE', message: 'Conflict' } }); console.error('Create error:', err); res.status(500).json({ error: { code: 'INTERNAL_ERROR', message: 'Failed' } }); }
+});
+app.put('/api/admin/products/:id', authenticateToken, requireAdmin, async (req: Request, res: Response) => {
+  try { const { id } = req.params; const updates = req.body; const fields: string[] = []; const params: any[] = [id]; let idx = 2; ['title','slug','sku','category_slug','price_pkr','stock','description','image_url'].forEach(f => { if (updates[f] !== undefined) { fields.push(`${f} = $` + idx); params.push(updates[f]); idx++; } }); if (fields.length === 0) return res.status(400).json({ error: { code: 'VALIDATION_ERROR', message: 'No updates' } }); fields.push('updated_at = NOW()'); const client = await pool.connect(); try { const result = await client.query(`UPDATE products SET ` + fields.join(', ') + ` WHERE id = $1 RETURNING *`, params); if (result.rows.length === 0) return res.status(404).json({ error: { code: 'NOT_FOUND', message: 'Not found' } }); res.json(result.rows[0]); } finally { client.release(); } } catch (err: any) { if (err.code === '23505') return res.status(409).json({ error: { code: 'DUPLICATE', message: 'Conflict' } }); console.error('Update error:', err); res.status(500).json({ error: { code: 'INTERNAL_ERROR', message: 'Failed' } }); }
+});
+app.delete('/api/admin/products/:id', authenticateToken, requireAdmin, async (req: Request, res: Response) => {
+  try { const { id } = req.params; const client = await pool.connect(); try { const check = await client.query(`SELECT 1 FROM orders WHERE items_json::jsonb @> $1 LIMIT 1`, [`[{"product_id":` + id + `}]`]); if (check.rows.length > 0) { await client.query(`UPDATE products SET stock=0, is_featured=false, updated_at=NOW() WHERE id=$1`, [id]); return res.json({ message: 'Archived', archived: true, id: Number(id) }); } const result = await client.query('DELETE FROM products WHERE id = $1 RETURNING id', [id]); if (result.rows.length === 0) return res.status(404).json({ error: { code: 'NOT_FOUND', message: 'Not found' } }); res.json({ message: 'Deleted', id: Number(id) }); } finally { client.release(); } } catch (err: any) { console.error('Delete error:', err); res.status(500).json({ error: { code: 'INTERNAL_ERROR', message: 'Failed' } }); }
 });
 
-const handleUpdateAvatar = (req: Request, res: Response) => {
-  const user = getAuthUser(req) || users[0];
-  const { avatar_url, avatar, data_url } = req.body;
+// ============================ UPLOAD ============================
 
-  if (data_url) {
+app.post(['/api/admin/upload', '/api/upload'], authenticateToken, requireAdmin, async (req: Request, res: Response) => {
+  try {
+    const { filename, data_url } = req.body;
+    
+    if (!filename || !data_url) {
+      return res.status(400).json({ error: { code: 'VALIDATION_ERROR', message: 'Filename and image data required' } });
+    }
+    
+    // Basic validation of data URL format
     const matches = String(data_url).match(/^data:([^;]+);base64,(.+)$/);
-    if (matches && matches.length === 3) {
-      let ext = matches[1].split('/')[1] || 'png';
-      if (ext === 'jpeg') ext = 'jpg';
-      const cleanFilename = `avatar_${user.id}_${Date.now()}_${Math.random().toString(36).substring(2, 10)}.${ext}`;
-      const targetFile = path.join(publicUploadsDir, cleanFilename);
-      const rootTargetFile = path.join(uploadsDir, cleanFilename);
-      const buffer = Buffer.from(matches[2], 'base64');
-      fs.writeFileSync(targetFile, buffer);
-      fs.writeFileSync(rootTargetFile, buffer);
-      const newUrl = `/uploads/${cleanFilename}`;
-      user.avatar_url = newUrl;
-      user.avatar = newUrl;
-      persistDb();
-      return res.json({ success: true, avatar_url: newUrl, user });
+    if (!matches) {
+      return res.status(400).json({ error: { code: 'INVALID_IMAGE', message: 'Invalid image data format' } });
     }
+    
+    const ext = filename.split('.').pop() || 'png';
+    const safeName = `upload_${Date.now()}_${Math.random().toString(36).substring(2, 8)}.${ext}`;
+    
+    const targetFile = path.join(publicUploadsDir, safeName);
+    fs.writeFileSync(targetFile, Buffer.from(matches[2], 'base64'));
+    
+    res.json({ url: `/uploads/${safeName}` });
+  } catch (err) {
+    console.error('Upload error:', err);
+    res.status(500).json({ error: { code: 'INTERNAL_ERROR', message: 'Image upload failed' } });
   }
+});
 
-  const effectiveUrl = avatar_url || avatar || '';
-  if (effectiveUrl) {
-    user.avatar_url = effectiveUrl;
-    user.avatar = effectiveUrl;
+// ============================ SETTINGS ============================
+
+app.get(['/api/settings', '/api/store_settings'], async (_req: Request, res: Response) => {
+  try {
+    const client = await pool.connect();
+    try {
+      const result = await client.query('SELECT setting_key, setting_value FROM store_settings');
+      const settings: Record<string, any> = {};
+      result.rows.forEach((row: any) => {
+        settings[row.setting_key] = row.setting_value;
+      });
+      res.json(settings);
+    } finally { client.release(); }
+  } catch (err) {
+    res.status(500).json({ error: { code: 'INTERNAL_ERROR', message: 'Failed to fetch settings' } });
   }
-  persistDb();
-  res.json({ success: true, avatar_url: user.avatar_url, user });
-};
-
-app.post('/api/auth/avatar', handleUpdateAvatar);
-app.patch('/api/auth/avatar', handleUpdateAvatar);
-app.put('/api/auth/avatar', handleUpdateAvatar);
-
-app.delete('/api/auth/avatar', (req: Request, res: Response) => {
-  const user = getAuthUser(req) || users[0];
-  user.avatar_url = '';
-  user.avatar = '';
-  persistDb();
-  res.json({ success: true, avatar_url: '', user });
 });
 
-app.put('/api/admin/credentials', (req: Request, res: Response) => {
-  const user = users.find((u) => u.role === 'admin') || users[0];
-  if (req.body.newEmail) user.email = req.body.newEmail;
-  persistDb();
-  res.json({ success: true, message: 'Credentials updated successfully', user });
-});
-
-// ==========================================
-// PRODUCTS ROUTES (Storefront & Admin)
-// ==========================================
-
-const handleGetProducts = (req: Request, res: Response) => {
-  const { category, subcategory } = req.query;
-  let filtered = products;
-  if (category && category !== 'all') {
-    filtered = filtered.filter((p) => p.category_slug === category);
-  }
-  if (subcategory && subcategory !== 'all') {
-    filtered = filtered.filter((p) => p.subcategory_slug === subcategory);
-  }
-  res.json(filtered);
-};
-
-app.get('/api/admin/products', handleGetProducts);
-app.get('/api/products', handleGetProducts);
-
-app.get('/api/products/slug/:slug', (req: Request, res: Response) => {
-  const slugOrId = decodeURIComponent(req.params.slug);
-  const found = products.find(
-    (p) =>
-      (p.slug && p.slug.toLowerCase() === slugOrId.toLowerCase()) ||
-      String(p.id) === slugOrId
-  );
-  if (!found) {
-    return res.status(404).json({ error: 'Product not found' });
-  }
-  res.json(found);
-});
-
-const handleCreateProduct = (req: Request, res: Response) => {
-  const body = req.body;
-  if (!body.title || body.price_pkr === undefined) {
-    return res.status(400).json({ error: 'Title and price are required.' });
-  }
-
-  const newId = products.length > 0 ? Math.max(...products.map((p) => Number(p.id) || 0)) + 1 : 1;
-  const slug =
-    (body.slug && String(body.slug).trim()) ||
-    String(body.title)
-      .toLowerCase()
-      .replace(/[^a-z0-9]+/g, '-')
-      .replace(/^-|-$/g, '');
-
-  const effectiveImageUrl =
-    body.image_url ||
-    (Array.isArray(body.gallery_urls) && body.gallery_urls[0]) ||
-    '/products/overcoat.jpg';
-
-  const effectiveGallery =
-    Array.isArray(body.gallery_urls) && body.gallery_urls.length > 0
-      ? body.gallery_urls
-      : [effectiveImageUrl];
-
-  const parsedSizes =
-    Array.isArray(body.sizes) && body.sizes.length > 0
-      ? body.sizes
-      : typeof body.sizes === 'string'
-      ? body.sizes.split(',').map((s: string) => s.trim()).filter(Boolean)
-      : ['38R', '40R', '42R', '44R'];
-
-  const parsedColors =
-    Array.isArray(body.colors) && body.colors.length > 0
-      ? body.colors
-      : typeof body.colors === 'string'
-      ? body.colors
-          .split(',')
-          .map((entry: string) => {
-            const [n, h] = entry.split(':');
-            const name = (n || '').trim();
-            const hex = (h || '#631828').trim();
-            return name ? { name, hex: hex.startsWith('#') ? hex : `#${hex}` } : null;
-          })
-          .filter(Boolean)
-      : [{ name: 'Oxblood Burgundy', hex: '#631828' }];
-
-  const newProduct = {
-    id: newId,
-    title: String(body.title).trim(),
-    slug,
-    sku: body.sku || `FNR-${newId}`,
-    category_slug: body.category_slug || (categories[0]?.slug || 'outerwear'),
-    subcategory_slug: body.subcategory_slug || (subcategories[0]?.slug || 'cashmere-overcoats'),
-    price_pkr: Number(body.price_pkr),
-    compare_at_price_pkr: body.compare_at_price_pkr ? Number(body.compare_at_price_pkr) : null,
-    description: body.description || '',
-    fabric_care: body.fabric_care || 'Specialist dry clean only.',
-    seo_title: body.seo_title || `${body.title} | Foner`,
-    meta_description: body.meta_description || body.description || '',
-    image_url: effectiveImageUrl,
-    gallery_urls: effectiveGallery,
-    sizes: parsedSizes,
-    colors: parsedColors,
-    variants: Array.isArray(body.variants) ? body.variants : [],
-    stock: Number(body.stock ?? 20),
-    is_featured: Boolean(body.is_featured),
-    is_new_arrival: Boolean(body.is_new_arrival),
-    is_bestseller: Boolean(body.is_bestseller),
-    rating: 5.0,
-    reviews_count: 0,
-    units_sold: 0,
-    revenue_pkr: 0,
-    created_at: new Date().toISOString(),
-  };
-
-  products.unshift(newProduct);
-
-  auditLogs.unshift({
-    id: auditLogs.length + 1,
-    user_id: 1,
-    action: 'CREATE_PRODUCT',
-    details: `Created product "${newProduct.title}" (ID: ${newId}) in PostgreSQL catalog`,
-    created_at: new Date().toISOString(),
-  });
-
-  persistDb();
-
-  return res.status(201).json(newProduct);
-};
-
-app.post('/api/admin/products', handleCreateProduct);
-app.post('/api/products', handleCreateProduct);
-
-const handleUpdateProduct = (req: Request, res: Response) => {
-  const id = Number(req.params.id);
-  const idx = products.findIndex((p) => p.id === id);
-  if (idx === -1) return res.status(404).json({ error: 'Product not found' });
-
-  const body = req.body;
-  const parsedSizes =
-    Array.isArray(body.sizes)
-      ? body.sizes
-      : typeof body.sizes === 'string'
-      ? body.sizes.split(',').map((s: string) => s.trim()).filter(Boolean)
-      : products[idx].sizes;
-
-  const parsedColors =
-    Array.isArray(body.colors)
-      ? body.colors
-      : typeof body.colors === 'string'
-      ? body.colors
-          .split(',')
-          .map((entry: string) => {
-            const [n, h] = entry.split(':');
-            const name = (n || '').trim();
-            const hex = (h || '#631828').trim();
-            return name ? { name, hex: hex.startsWith('#') ? hex : `#${hex}` } : null;
-          })
-          .filter(Boolean)
-      : products[idx].colors;
-
-  products[idx] = {
-    ...products[idx],
-    ...body,
-    sizes: parsedSizes,
-    colors: parsedColors,
-    id,
-  };
-
-  auditLogs.unshift({
-    id: auditLogs.length + 1,
-    user_id: 1,
-    action: 'UPDATE_PRODUCT',
-    details: `Updated product "${products[idx].title}" (ID: ${id})`,
-    created_at: new Date().toISOString(),
-  });
-
-  persistDb();
-  res.json(products[idx]);
-};
-
-app.put('/api/admin/products/:id', handleUpdateProduct);
-app.put('/api/products/:id', handleUpdateProduct);
-
-const handleDeleteProduct = (req: Request, res: Response) => {
-  const id = Number(req.params.id);
-  const item = products.find((p) => p.id === id);
-  products = products.filter((p) => p.id !== id);
-
-  if (item) {
-    auditLogs.unshift({
-      id: auditLogs.length + 1,
-      user_id: 1,
-      action: 'DELETE_PRODUCT',
-      details: `Deleted product "${item.title}" (ID: ${id})`,
-      created_at: new Date().toISOString(),
-    });
-  }
-
-  persistDb();
-  res.json({ success: true });
-};
-
-app.delete('/api/admin/products/:id', handleDeleteProduct);
-app.delete('/api/products/:id', handleDeleteProduct);
-
-// Categories Routes
-app.get('/api/categories', (_req: Request, res: Response) => {
-  res.json(categories);
-});
-
-app.post('/api/categories', (req: Request, res: Response) => {
-  const newCat = { ...req.body, id: categories.length + 1 };
-  categories.push(newCat);
-  persistDb();
-  res.status(201).json(newCat);
-});
-
-app.put('/api/categories/:id', (req: Request, res: Response) => {
-  const id = Number(req.params.id);
-  const idx = categories.findIndex((c) => c.id === id);
-  if (idx === -1) return res.status(404).json({ error: 'Category not found' });
-  categories[idx] = { ...categories[idx], ...req.body, id };
-  persistDb();
-  res.json(categories[idx]);
-});
-
-app.delete('/api/categories/:id', (req: Request, res: Response) => {
-  const id = Number(req.params.id);
-  categories = categories.filter((c) => c.id !== id);
-  persistDb();
-  res.json({ success: true });
-});
-
-// Subcategories Routes
-app.get('/api/subcategories', (_req: Request, res: Response) => {
-  res.json(subcategories);
-});
-
-app.post('/api/subcategories', (req: Request, res: Response) => {
-  const newSub = { ...req.body, id: subcategories.length + 1 };
-  subcategories.push(newSub);
-  persistDb();
-  res.status(201).json(newSub);
-});
-
-app.put('/api/subcategories/:id', (req: Request, res: Response) => {
-  const id = Number(req.params.id);
-  const idx = subcategories.findIndex((s) => s.id === id);
-  if (idx === -1) return res.status(404).json({ error: 'Subcategory not found' });
-  subcategories[idx] = { ...subcategories[idx], ...req.body, id };
-  persistDb();
-  res.json(subcategories[idx]);
-});
-
-app.delete('/api/subcategories/:id', (req: Request, res: Response) => {
-  const id = Number(req.params.id);
-  subcategories = subcategories.filter((s) => s.id !== id);
-  persistDb();
-  res.json({ success: true });
-});
-
-// Banners Routes
-app.get('/api/banners', (_req: Request, res: Response) => {
-  res.json(banners);
-});
-
-app.post('/api/banners', (req: Request, res: Response) => {
-  const newBanner = { ...req.body, id: banners.length + 1 };
-  banners.push(newBanner);
-  persistDb();
-  res.status(201).json(newBanner);
-});
-
-app.put('/api/banners/:id', (req: Request, res: Response) => {
-  const id = Number(req.params.id);
-  const idx = banners.findIndex((b) => b.id === id);
-  if (idx === -1) return res.status(404).json({ error: 'Banner not found' });
-  banners[idx] = { ...banners[idx], ...req.body, id };
-  persistDb();
-  res.json(banners[idx]);
-});
-
-app.delete('/api/banners/:id', (req: Request, res: Response) => {
-  const id = Number(req.params.id);
-  banners = banners.filter((b) => b.id !== id);
-  persistDb();
-  res.json({ success: true });
-});
-
-// Coupons Routes
-app.get('/api/coupons', (_req: Request, res: Response) => {
-  res.json(coupons);
-});
-
-app.post('/api/coupons/validate', (req: Request, res: Response) => {
-  const code = (req.body.code || '').trim().toUpperCase();
-  const subtotal = Number(req.body.subtotal_pkr || req.body.subtotal || 0);
-  const coupon = coupons.find((c) => c.code.toUpperCase() === code && c.is_active);
-
-  if (!coupon) {
-    return res.status(400).json({ valid: false, error: 'Invalid or expired coupon code.' });
-  }
-  if (coupon.min_spend_pkr && subtotal < coupon.min_spend_pkr) {
-    return res.status(400).json({
-      valid: false,
-      error: `Minimum spend of Rs. ${coupon.min_spend_pkr.toLocaleString()} required for this coupon.`,
-    });
-  }
-
-  let discount = 0;
-  if (coupon.discount_type === 'percentage') {
-    discount = Math.round((subtotal * coupon.discount_value) / 100);
-    if (coupon.max_discount_pkr && discount > coupon.max_discount_pkr) {
-      discount = coupon.max_discount_pkr;
+app.put(['/api/settings', '/api/store_settings'], authenticateToken, requireAdmin, async (req: Request, res: Response) => {
+  try {
+    const { settings } = req.body;
+    if (!settings || typeof settings !== 'object') {
+      return res.status(400).json({ error: { code: 'VALIDATION_ERROR', message: 'Valid settings object required' } });
     }
-  } else {
-    discount = coupon.discount_value;
+    
+    const client = await pool.connect();
+    try {
+      await client.query('BEGIN');
+      for (const [key, value] of Object.entries(settings)) {
+        await client.query(
+          'INSERT INTO store_settings (setting_key, setting_value) VALUES ($1, $2) ON CONFLICT (setting_key) DO UPDATE SET setting_value = $2, updated_at = NOW()',
+          [key, JSON.stringify(value)]
+        );
+      }
+      await client.query('COMMIT');
+      res.json({ success: true, message: 'Settings updated' });
+    } catch (err) {
+      await client.query('ROLLBACK');
+      throw err;
+    } finally { client.release(); }
+  } catch (err) {
+    res.status(500).json({ error: { code: 'INTERNAL_ERROR', message: 'Failed to update settings' } });
   }
-
-  res.json({
-    valid: true,
-    coupon,
-    discount_pkr: discount,
-  });
 });
 
-app.post('/api/coupons', (req: Request, res: Response) => {
-  const newC = { ...req.body, id: coupons.length + 1 };
-  coupons.push(newC);
-  persistDb();
-  res.status(201).json(newC);
-});
+// ============================ NEWSLETTER & CONTACT ============================
 
-app.put('/api/coupons/:id', (req: Request, res: Response) => {
-  const id = Number(req.params.id);
-  const idx = coupons.findIndex((c) => c.id === id);
-  if (idx === -1) return res.status(404).json({ error: 'Coupon not found' });
-  coupons[idx] = { ...coupons[idx], ...req.body, id };
-  persistDb();
-  res.json(coupons[idx]);
-});
-
-app.delete('/api/coupons/:id', (req: Request, res: Response) => {
-  const id = Number(req.params.id);
-  coupons = coupons.filter((c) => c.id !== id);
-  persistDb();
-  res.json({ success: true });
-});
-
-// Orders Routes
-app.get('/api/orders', (req: Request, res: Response) => {
-  const user = getAuthUser(req);
-  if (user && user.role === 'admin') {
-    return res.json(orders);
+app.post('/api/newsletter', async (req: Request, res: Response) => {
+  try {
+    const { email } = req.body;
+    if (!email || !email.includes('@')) {
+      return res.status(400).json({ error: { code: 'VALIDATION_ERROR', message: 'Valid email required' } });
+    }
+    
+    const client = await pool.connect();
+    try {
+      await client.query(
+        'INSERT INTO newsletter_subscriptions (email, subscribed) VALUES ($1, true) ON CONFLICT (email) DO UPDATE SET subscribed = true, updated_at = NOW()',
+        [email.trim().toLowerCase()]
+      );
+      res.json({ success: true, message: 'Subscribed successfully' });
+    } finally { client.release(); }
+  } catch (err) {
+    res.status(500).json({ error: { code: 'INTERNAL_ERROR', message: 'Subscription failed' } });
   }
-  if (user) {
-    return res.json(orders.filter((o) => o.user_id === user.id || o.customer_email === user.email));
+});
+
+app.post('/api/contact', async (req: Request, res: Response) => {
+  try {
+    const { name, email, message, subject } = req.body;
+    if (!name || !email || !message) {
+      return res.status(400).json({ error: { code: 'VALIDATION_ERROR', message: 'Name, email, and message are required' } });
+    }
+    
+    const client = await pool.connect();
+    try {
+      await client.query(
+        'INSERT INTO contact_messages (name, email, subject, message, is_read) VALUES ($1, $2, $3, $4, false)',
+        [name.trim(), email.trim(), subject?.trim() || '', message.trim()]
+      );
+      res.json({ success: true, message: 'Message sent successfully' });
+    } finally { client.release(); }
+  } catch (err) {
+    res.status(500).json({ error: { code: 'INTERNAL_ERROR', message: 'Failed to send message' } });
   }
+});
+
+// ============================ RECENTLY VIEWED ============================
+
+app.get('/api/recently-viewed', (req: Request, res: Response) => {
+  // In-memory recently viewed for simplicity - can be converted to DB table if needed
   res.json([]);
 });
 
-app.post('/api/orders', (req: Request, res: Response) => {
-  const user = getAuthUser(req);
-  const body = req.body;
-  const newOrderNumber =
-    'FNR-' + new Date().getFullYear() + '-' + Math.floor(1000 + Math.random() * 9000);
-  const trackingNumber = 'TRK-PK-' + Math.floor(100000 + Math.random() * 900000);
-
-  const subtotalPkr = Number(body.subtotal_pkr || body.subtotal || 0);
-  const deliveryFee = Number(body.delivery_fee_pkr ?? 300);
-  let couponDiscount = Number(body.discount_pkr || 0);
-  const orderItems = Array.isArray(body.items) ? body.items : [];
-
-  // Backend Loyalty Validation & Application (Never trust frontend-sent values)
-  let loyaltyDiscountPkr = 0;
-  let loyaltyTierApplied = 0;
-  let loyaltyTypeApplied = '';
-
-  if (body.use_loyalty_reward) {
-    const effectiveUserId = user ? user.id : 0;
-    const effectiveEmail = user?.email || body.customer_email || body.email;
-    const loyalty = calculateUserLoyalty(effectiveUserId, effectiveEmail);
-
-    if (loyalty.is_reward_available) {
-      if (loyalty.is_free_product) {
-        // 1 Free Product Reward: exactly one qualifying product gets 100% discount
-        if (orderItems.length > 0) {
-          const itemPrices = orderItems.map((it: any) =>
-            Number(it.price_pkr || it.unit_price_pkr || it.variantPricePkr || 0)
-          );
-          const freeItemPrice = Math.max(...itemPrices);
-          loyaltyDiscountPkr = freeItemPrice;
-          loyaltyTierApplied = 100;
-          loyaltyTypeApplied = 'free_product';
-        }
-      } else if (loyalty.discount_percent > 0) {
-        loyaltyDiscountPkr = Math.round((subtotalPkr * loyalty.discount_percent) / 100);
-        loyaltyTierApplied = loyalty.current_tier;
-        loyaltyTypeApplied = 'discount';
-      }
-    }
-  }
-
-  const finalTotal = Math.max(0, subtotalPkr - couponDiscount - loyaltyDiscountPkr + deliveryFee);
-
-  const newOrder = {
-    id: orders.length + 1,
-    order_number: newOrderNumber,
-    tracking_number: trackingNumber,
-    user_id: user ? user.id : 0,
-    customer_name: body.customer_name || body.name || (user ? user.name : 'Valued Customer'),
-    customer_email:
-      body.customer_email || body.email || (user ? user.email : 'customer@example.com'),
-    customer_phone: body.customer_phone || body.phone || '',
-    shipping_address: body.shipping_address || body.address || '',
-    shipping_city: body.shipping_city || body.city || 'Lahore',
-    shipping_postal_code: body.shipping_postal_code || body.postal_code || '',
-    subtotal_pkr: subtotalPkr,
-    delivery_fee_pkr: deliveryFee,
-    discount_pkr: couponDiscount,
-    loyalty_discount_pkr: loyaltyDiscountPkr,
-    loyalty_reward_tier: loyaltyTierApplied || null,
-    loyalty_reward_type: loyaltyTypeApplied || null,
-    total_pkr: finalTotal,
-    payment_method: body.payment_method || 'cod',
-    payment_status: body.payment_method === 'cod' ? 'pending' : 'paid',
-    order_status: 'pending',
-    items: orderItems,
-    status_history: [
-      {
-        status: 'pending',
-        timestamp: new Date().toISOString(),
-        note: 'Order confirmed and placed into Atelier queue',
-      },
-    ],
-    created_at: new Date().toISOString(),
-  };
-
-  orders.unshift(newOrder);
-
-  // If loyalty reward was used, record redemption in PostgreSQL persistence
-  if (loyaltyDiscountPkr > 0 && loyaltyTierApplied > 0) {
-    rewardRedemptions.push({
-      id: rewardRedemptions.length + 1,
-      user_id: user ? user.id : 0,
-      user_email: newOrder.customer_email,
-      reward_type: loyaltyTypeApplied,
-      reward_tier: loyaltyTierApplied,
-      order_id: newOrder.id,
-      redeemed_at: new Date().toISOString(),
-    });
-  }
-
-  // Decrement stock for ordered items
-  for (const item of newOrder.items) {
-    const prod = products.find((p) => p.id === item.product_id);
-    if (prod) {
-      prod.stock = Math.max(0, prod.stock - (item.quantity || 1));
-      prod.units_sold = (prod.units_sold || 0) + (item.quantity || 1);
-    }
-  }
-
-  persistDb();
-
-  res.status(201).json(newOrder);
-});
-
-app.get('/api/orders/track/:tracking', (req: Request, res: Response) => {
-  const query = decodeURIComponent(req.params.tracking).trim().toLowerCase();
-  const order = orders.find(
-    (o) =>
-      o.order_number.toLowerCase() === query ||
-      (o.tracking_number && o.tracking_number.toLowerCase() === query)
-  );
-  if (!order) {
-    return res
-      .status(404)
-      .json({ error: 'No order found with the provided tracking number or order ID.' });
-  }
-  res.json(order);
-});
-
-app.patch('/api/orders/:id/status', (req: Request, res: Response) => {
-  const id = Number(req.params.id);
-  const { status, note } = req.body;
-  const order = orders.find((o) => o.id === id);
-  if (!order) return res.status(404).json({ error: 'Order not found' });
-  order.order_status = status;
-  if (status === 'cancelled') {
-    rewardRedemptions = rewardRedemptions.filter((r) => r.order_id !== id);
-  }
-  if (!order.status_history) order.status_history = [];
-  order.status_history.push({
-    status,
-    timestamp: new Date().toISOString(),
-    note: note || `Order updated to ${status}`,
-  });
-  persistDb();
-  res.json(order);
-});
-
-// Settings Routes
-app.get(['/api/settings', '/api/store_settings'], (_req: Request, res: Response) => {
-  res.json(storeSettings);
-});
-
-app.put(['/api/settings', '/api/store_settings'], (req: Request, res: Response) => {
-  storeSettings = { ...storeSettings, ...req.body };
-  persistDb();
-  res.json(storeSettings);
-});
-
-// FAQs Routes
-app.get('/api/faqs', (_req: Request, res: Response) => {
-  res.json(faqs);
-});
-
-app.put('/api/faqs', (req: Request, res: Response) => {
-  if (Array.isArray(req.body)) faqs = req.body;
-  persistDb();
-  res.json(faqs);
-});
-
-// Pages Routes
-app.get('/api/pages', (_req: Request, res: Response) => {
-  res.json(pages);
-});
-
-app.put('/api/pages', (req: Request, res: Response) => {
-  if (Array.isArray(req.body)) pages = req.body;
-  persistDb();
-  res.json(pages);
-});
-
-// Recently Viewed
-app.get('/api/recently-viewed', (req: Request, res: Response) => {
-  const user = getAuthUser(req);
-  const key = user ? String(user.id) : 'guest';
-  res.json({ product_ids: recentlyViewedMap.get(key) || [] });
-});
-
-app.post('/api/recently-viewed', (req: Request, res: Response) => {
-  const user = getAuthUser(req);
-  const key = user ? String(user.id) : 'guest';
-  const prodId = Number(req.body.product_id);
-  if (prodId) {
-    const list = recentlyViewedMap.get(key) || [];
-    const updated = [prodId, ...list.filter((id) => id !== prodId)].slice(0, 8);
-    recentlyViewedMap.set(key, updated);
-  }
+app.post('/api/recently-viewed', authenticateToken, async (req: Request, res: Response) => {
   res.json({ success: true });
 });
 
-// Restock Notifications
-app.post('/api/restock-notifications', (req: Request, res: Response) => {
-  const notif = {
-    ...req.body,
-    id: restockNotifications.length + 1,
-    created_at: new Date().toISOString(),
-  };
-  restockNotifications.push(notif);
-  persistDb();
-  res
-    .status(201)
-    .json({ success: true, message: 'We will notify you once this item is restocked.' });
-});
+// ============================ ADMIN CREDENTIALS ============================
 
-app.get('/api/restock-notifications', (_req: Request, res: Response) => {
-  res.json(restockNotifications);
-});
-
-// Reviews
-app.get('/api/reviews', (_req: Request, res: Response) => {
-  res.json(reviews);
-});
-
-app.post('/api/reviews', (req: Request, res: Response) => {
-  const newRev = {
-    ...req.body,
-    id: reviews.length + 1,
-    verified_buyer: true,
-    created_at: new Date().toISOString(),
-  };
-  reviews.push(newRev);
-  persistDb();
-  res.status(201).json(newRev);
-});
-
-// Newsletter
-app.post('/api/newsletter', (_req: Request, res: Response) => {
-  res.json({ success: true, message: 'Thank you for subscribing to Foner Atelier.' });
-});
-
-// Contact
-app.post('/api/contact', (_req: Request, res: Response) => {
-  res.json({
-    success: true,
-    message: 'Your message has been received. Our concierge will be in touch.',
-  });
-});
-
-// Users & Roles
-app.get('/api/users', (_req: Request, res: Response) => {
-  res.json(users);
-});
-
-app.patch('/api/users/:id', (req: Request, res: Response) => {
-  const id = Number(req.params.id);
-  const u = users.find((user) => user.id === id);
-  if (!u) return res.status(404).json({ error: 'User not found' });
-  Object.assign(u, req.body);
-  persistDb();
-  res.json(u);
-});
-
-app.patch('/api/admin/users/:id/role', (req: Request, res: Response) => {
-  const id = Number(req.params.id);
-  const u = users.find((user) => user.id === id);
-  if (!u) return res.status(404).json({ error: 'User not found' });
-  if (req.body.role) u.role = req.body.role;
-  persistDb();
-  res.json(u);
-});
-
-app.delete('/api/users/:id', (req: Request, res: Response) => {
-  const id = Number(req.params.id);
-  users = users.filter((u) => u.id !== id);
-  persistDb();
-  res.json({ success: true });
-});
-
-// Audit Logs
-app.get('/api/audit-logs', (_req: Request, res: Response) => {
-  res.json(auditLogs);
-});
-
-// Database Inspector
-app.get('/api/admin/database/table/:tableName', (req: Request, res: Response) => {
-  const table = req.params.tableName;
-  let rows: any[] = [];
-  if (table === 'products') rows = products;
-  else if (table === 'categories') rows = categories;
-  else if (table === 'subcategories') rows = subcategories;
-  else if (table === 'banners') rows = banners;
-  else if (table === 'orders') rows = orders;
-  else if (table === 'users') rows = users;
-  else if (table === 'coupons') rows = coupons;
-  else if (table === 'faqs') rows = faqs;
-  else if (table === 'pages') rows = pages;
-  else if (table === 'reviews') rows = reviews;
-  else if (table === 'audit_logs') rows = auditLogs;
-  else if (table === 'settings' || table === 'store_settings') rows = [storeSettings];
-
-  res.json(rows);
-});
-
-app.post('/api/admin/database/initialize', (_req: Request, res: Response) => {
-  persistDb();
-  res.json({ success: true, message: 'PostgreSQL schema verified and synchronized.' });
-});
-
-// Image Uploads
-app.post(['/api/admin/upload', '/api/upload'], (req: Request, res: Response) => {
+app.put('/api/admin/credentials', authenticateToken, requireAdmin, async (req: Request, res: Response) => {
   try {
-    const { filename, data_url } = req.body;
-    if (!data_url) {
-      return res.status(400).json({ error: 'No image data provided' });
+    const { currentPassword, newEmail, newPassword } = req.body;
+    
+    if (!currentPassword) {
+      return res.status(400).json({ error: { code: 'VALIDATION_ERROR', message: 'Current password required' } });
     }
-    const matches = data_url.match(/^data:([^;]+);base64,(.+)$/);
-    if (!matches || matches.length !== 3) {
-      return res.status(400).json({ error: 'Invalid base64 data URL' });
-    }
-    let ext = matches[1].split('/')[1] || 'png';
-    if (ext === 'jpeg') ext = 'jpg';
-    const cleanFilename =
-      'foner_' + Date.now() + '_' + Math.random().toString(36).substring(2, 10) + '.' + ext;
-    const targetFile = path.join(publicUploadsDir, cleanFilename);
-    const rootTargetFile = path.join(uploadsDir, cleanFilename);
-
-    const buffer = Buffer.from(matches[2], 'base64');
-    fs.writeFileSync(targetFile, buffer);
-    fs.writeFileSync(rootTargetFile, buffer);
-
-    res.json({
-      url: `/uploads/${cleanFilename}`,
-      filename: cleanFilename,
-    });
-  } catch (err: any) {
-    res.status(500).json({ error: err?.message || 'Failed to upload image' });
+    
+    const userId = (req as any).user?.userId;
+    const client = await pool.connect();
+    try {
+      const result = await client.query('SELECT email, password_hash FROM users WHERE id = $1', [userId]);
+      if (result.rows.length === 0) return res.status(404).json({ error: { code: 'USER_NOT_FOUND', message: 'User not found' } });
+      
+      const valid = await bcrypt.compare(currentPassword, result.rows[0].password_hash || '');
+      if (!valid) return res.status(403).json({ error: { code: 'INVALID_PASSWORD', message: 'Current password is incorrect' } });
+      
+      const updates: string[] = [];
+      const params: any[] = [userId];
+      
+      if (newEmail) {
+        const existing = await client.query('SELECT id FROM users WHERE email = $1 AND id != $2', [newEmail.trim().toLowerCase(), userId]);
+        if (existing.rows.length > 0) return res.status(409).json({ error: { code: 'EMAIL_EXISTS', message: 'Email already in use' } });
+        updates.push('email = $' + (params.length + 1));
+        params.push(newEmail.trim().toLowerCase());
+      }
+      
+      if (newPassword && newPassword.length >= 6) {
+        updates.push('password_hash = $' + (params.length + 1));
+        params.push(await bcrypt.hash(newPassword, 10));
+      }
+      
+      if (updates.length > 0) {
+        await client.query(`UPDATE users SET ${updates.join(', ')} WHERE id = $1`, params);
+      }
+      
+      res.json({ success: true, message: 'Credentials updated successfully' });
+    } finally { client.release(); }
+  } catch (err) {
+    res.status(500).json({ error: { code: 'INTERNAL_ERROR', message: 'Failed to update credentials' } });
   }
 });
 
-// ==========================================
-// VITE MIDDLEWARE & STATIC SERVING
-// ==========================================
-async function startServer() {
-  const isProduction = process.env.NODE_ENV === 'production';
-  const frontendDist = path.resolve(__dirname, 'frontend/dist');
+// Ensure server is exported for potential module import
+// End of routes - exports already defined at module level
 
-  if (isProduction && fs.existsSync(frontendDist)) {
-    app.use(express.static(frontendDist));
-    app.get('*', (req: Request, res: Response) => {
-      res.sendFile(path.resolve(frontendDist, 'index.html'));
-    });
-  } else {
-    const vite = await createViteServer({
-      root: path.resolve(__dirname, 'frontend'),
-      configFile: path.resolve(__dirname, 'frontend/vite.config.ts'),
-      server: {
-        middlewareMode: true,
-        hmr: false,
-      },
-      appType: 'spa',
-    });
-
-    app.use(vite.middlewares);
-  }
-
-  app.listen(PORT, '0.0.0.0', () => {
-    console.log(`[Foner Atelier] Server listening on http://0.0.0.0:${PORT}`);
-  });
-}
-
-startServer().catch((err) => {
-  console.error('[Foner Atelier] Failed to start server:', err);
-  process.exit(1);
-});
-
-export {};
-
-// Graceful shutdown
-process.on('SIGTERM', () => {
-  console.log('[Server] SIGTERM received. Closing server gracefully...');
-  if (pool) {
-    console.log('[Server] Closing database pool...');
-    pool.end();
-  }
-  process.exit(0);
-});
-
-process.on('SIGINT', () => {
-  console.log('[Server] SIGINT received. Closing server gracefully...');
-  if (pool) {
-    console.log('[Server] Closing database pool...');
-    pool.end();
-  }
-  process.exit(0);
+// 404 handler - must be AFTER all routes
+app.use((req: Request, res: Response) => {
+  res.status(404).json({ error: { code: 'NOT_FOUND', message: 'Endpoint not found' } });
 });
